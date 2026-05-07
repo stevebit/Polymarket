@@ -5,14 +5,20 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "polymarket-manual"
 version = "0.1.0"
-description = "Manual Polymarket CLOB helpers (Python)"
+description = "Manual Polymarket CLOB helpers (Python) and weather research package"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "py-clob-client-v2>=1.0.0,<2",
     "python-dotenv>=1.0.0",
+    "psycopg[binary,pool]>=3.2",
+    "httpx>=0.28",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "matplotlib>=3.8",
+    "scipy>=1.13",
 ]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["polymarket_manual*"]
+include = ["polymarket_manual*", "polymarket_weather*"]
