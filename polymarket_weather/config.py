@@ -46,7 +46,11 @@ def http_user_agent() -> str:
 
 
 def station_slugs() -> List[str]:
-    raw = os.environ.get("WEATHER_STATIONS", "nyc,chicago,los-angeles")
+    from .stations import default_station_csv
+
+    raw = os.environ.get("WEATHER_STATIONS")
+    if raw is None or not raw.strip():
+        raw = default_station_csv()
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 

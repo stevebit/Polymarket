@@ -9,13 +9,24 @@ TMAX in F. For a Gaussian forecast ``X ~ N(mu, sigma)``:
 
 We renormalise the bucket vector across each event so probabilities sum to 1
 (small renormalisation absorbs tail mass beyond the union of buckets).
+
+Predictive distributions
+------------------------
+Three predictive distribution families are supported, behind a single
+``predict_bucket_probs`` interface:
+
+* :class:`GaussianDist` — single Gaussian (used by M0, M1, EMOS-corrected sources).
+* :class:`GaussianMixture` — equally- or custom-weighted mixture of Gaussians,
+  used by M2 to blend per-source EMOS-corrected predictives.
+* :class:`EmpiricalCDF` — direct samples (e.g. ensemble members), with the
+  same continuity correction applied at integer-F bucket edges.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Iterable, Protocol, Sequence
 
 import numpy as np
 from scipy.stats import norm
@@ -28,13 +39,142 @@ class BucketBounds:
     hi_f: float | None
 
 
+class Distribution(Protocol):
+    """Predictive distribution interface; bucket integration uses ``cdf``."""
+
+    def cdf(self, x: float) -> float:  # noqa: D401
+        """Cumulative density at ``x`` (degrees F)."""
+
+    @property
+    def mean(self) -> float:  # used for legacy ``predicted_max_f`` storage
+        ...
+
+    @property
+    def std(self) -> float:  # used for legacy ``predicted_std_f`` storage
+        ...
+
+
+@dataclass(frozen=True)
+class GaussianDist:
+    mean_f: float
+    std_f: float
+
+    def cdf(self, x: float) -> float:
+        if self.std_f <= 0:
+            return 1.0 if x >= self.mean_f else 0.0
+        return float(norm.cdf(x, loc=self.mean_f, scale=self.std_f))
+
+    @property
+    def mean(self) -> float:
+        return float(self.mean_f)
+
+    @property
+    def std(self) -> float:
+        return float(max(self.std_f, 0.0))
+
+
+@dataclass(frozen=True)
+class GaussianMixture:
+    weights: tuple[float, ...]
+    means: tuple[float, ...]
+    stds: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        if not (len(self.weights) == len(self.means) == len(self.stds)):
+            raise ValueError("weights, means, stds must have same length")
+        if not self.weights:
+            raise ValueError("at least one component required")
+
+    def cdf(self, x: float) -> float:
+        wsum = sum(self.weights)
+        if wsum <= 0:
+            return 0.0
+        out = 0.0
+        for w, mu, sd in zip(self.weights, self.means, self.stds):
+            if sd <= 0:
+                out += (w / wsum) * (1.0 if x >= mu else 0.0)
+            else:
+                out += (w / wsum) * float(norm.cdf(x, loc=mu, scale=sd))
+        return out
+
+    @property
+    def mean(self) -> float:
+        wsum = sum(self.weights)
+        if wsum <= 0:
+            return 0.0
+        return sum(w * m for w, m in zip(self.weights, self.means)) / wsum
+
+    @property
+    def std(self) -> float:
+        wsum = sum(self.weights)
+        if wsum <= 0:
+            return 0.0
+        mu_bar = self.mean
+        # Total variance = E[Var | k] + Var[E[. | k]]
+        ev = sum(w * (sd**2) for w, sd in zip(self.weights, self.stds)) / wsum
+        ve = sum(w * (m - mu_bar) ** 2 for w, m in zip(self.weights, self.means)) / wsum
+        return float(math.sqrt(max(ev + ve, 0.0)))
+
+
+@dataclass(frozen=True)
+class EmpiricalCDF:
+    """Empirical CDF over a fixed sample (e.g. ensemble members).
+
+    ``samples`` is sorted ascending. CDF is the right-continuous step
+    function: ``CDF(x) = #{s <= x} / N``.
+    """
+
+    samples: tuple[float, ...]
+
+    def cdf(self, x: float) -> float:
+        if not self.samples:
+            return 0.0
+        # binary search
+        n = len(self.samples)
+        lo, hi = 0, n
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self.samples[mid] <= x:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo / n
+
+    @property
+    def mean(self) -> float:
+        return float(np.mean(self.samples)) if self.samples else 0.0
+
+    @property
+    def std(self) -> float:
+        if len(self.samples) < 2:
+            return 0.0
+        return float(np.std(self.samples, ddof=1))
+
+
+# ---------------------------------------------------------------------------
+# Bucket integration
+# ---------------------------------------------------------------------------
+
+
+def _bucket_prob_from_cdf(bucket: BucketBounds, cdf) -> float:
+    if bucket.lo_f is None and bucket.hi_f is not None:
+        return float(cdf(bucket.hi_f + 0.5))
+    if bucket.hi_f is None and bucket.lo_f is not None:
+        return float(1.0 - cdf(bucket.lo_f - 0.5))
+    if bucket.lo_f is not None and bucket.hi_f is not None:
+        hi = float(cdf(bucket.hi_f + 0.5))
+        lo = float(cdf(bucket.lo_f - 0.5))
+        return max(0.0, hi - lo)
+    return 0.0
+
+
 def bucket_probability(
     bucket: BucketBounds,
     mean_f: float,
     std_f: float,
 ) -> float:
+    """Backwards-compatible shim around :class:`GaussianDist`."""
     if std_f <= 0:
-        # Degenerate forecast: hand back a hard 0/1 about ``mean_f``.
         v = round(mean_f)
         if bucket.lo_f is None and bucket.hi_f is not None:
             return 1.0 if v <= int(bucket.hi_f) else 0.0
@@ -43,16 +183,20 @@ def bucket_probability(
         if bucket.lo_f is not None and bucket.hi_f is not None:
             return 1.0 if int(bucket.lo_f) <= v <= int(bucket.hi_f) else 0.0
         return 0.0
+    return _bucket_prob_from_cdf(bucket, GaussianDist(mean_f, std_f).cdf)
 
-    if bucket.lo_f is None and bucket.hi_f is not None:
-        return float(norm.cdf(bucket.hi_f + 0.5, loc=mean_f, scale=std_f))
-    if bucket.hi_f is None and bucket.lo_f is not None:
-        return float(1.0 - norm.cdf(bucket.lo_f - 0.5, loc=mean_f, scale=std_f))
-    if bucket.lo_f is not None and bucket.hi_f is not None:
-        hi = float(norm.cdf(bucket.hi_f + 0.5, loc=mean_f, scale=std_f))
-        lo = float(norm.cdf(bucket.lo_f - 0.5, loc=mean_f, scale=std_f))
-        return max(0.0, hi - lo)
-    return 0.0
+
+def predict_bucket_probs(
+    buckets: Sequence[BucketBounds],
+    distribution: Distribution,
+) -> dict[str, float]:
+    """Distribution-agnostic bucket integration with renormalisation."""
+    raw = {b.label: _bucket_prob_from_cdf(b, distribution.cdf) for b in buckets}
+    s = sum(raw.values())
+    if s <= 0:
+        n = max(1, len(buckets))
+        return {k: 1.0 / n for k in raw}
+    return {k: v / s for k, v in raw.items()}
 
 
 def event_probabilities(
@@ -60,14 +204,8 @@ def event_probabilities(
     mean_f: float,
     std_f: float,
 ) -> dict[str, float]:
-    raw = {b.label: bucket_probability(b, mean_f, std_f) for b in buckets}
-    s = sum(raw.values())
-    if s <= 0:
-        # All zero (e.g. degenerate spike outside every bucket): fall back to
-        # uniform so bookkeeping stays sane.
-        n = max(1, len(buckets))
-        return {k: 1.0 / n for k in raw}
-    return {k: v / s for k, v in raw.items()}
+    """Backwards-compatible shim that builds a Gaussian and integrates."""
+    return predict_bucket_probs(buckets, GaussianDist(mean_f, std_f))
 
 
 def realised_bucket(

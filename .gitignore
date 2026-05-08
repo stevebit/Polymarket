@@ -9,5 +9,7 @@ __pycache__/
 dist/
 build/
 reports/
-data/
+logs/
+# Repo-root data downloads only (do not ignore polymarket_weather/data/).
+/data/
 *.pgpass

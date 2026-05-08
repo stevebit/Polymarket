@@ -4,6 +4,13 @@ For each past ``(model_id, event_slug)`` we have ``bucket_probs`` for, identify
 the realised bucket from the matching ``observations`` row and compute log-loss
 + Brier score. A reliability diagram is drawn from the *flattened* prediction /
 indicator pairs across all buckets.
+
+The special model id ``market:mid`` does not look in ``bucket_probs`` at all —
+instead it derives a probability vector per resolved event from the latest
+``pm_market_snapshots.mid`` per bucket, normalised across the event. That gives
+a like-for-like comparison: how good is the market itself at pricing each
+realised outcome, vs the same scoring grid that M0 / M1 / M2 are scored on.
+This is the only honest baseline for "do we beat the market".
 """
 
 from __future__ import annotations
@@ -34,6 +41,8 @@ from .score import (
 from .stations import REGISTRY
 
 log = logging.getLogger(__name__)
+
+MODEL_MARKET_MID = "market:mid"
 
 
 @dataclass
@@ -96,6 +105,66 @@ def _fetch_resolved_buckets(
           AND s.slug = ANY(%s)
         """,
         (model_id, cutoff, list(station_slugs)),
+    )
+    return list(cur.fetchall())
+
+
+def _fetch_market_baseline_buckets(
+    cur, station_slugs: Sequence[str], lookback_days: int
+) -> list[tuple]:
+    """Same row shape as :func:`_fetch_resolved_buckets`, but ``prob`` is the
+    latest ``pm_market_snapshots.mid`` per ``(event_slug, bucket_label)``,
+    normalised across the event.
+
+    Snapshot semantics: Polymarket markets close 12:00 UTC on the target day,
+    so the "latest" snapshot is effectively the closing-time consensus mid.
+    For events that have never been snapshotted we leave ``prob`` NULL and
+    they get dropped during normalisation."""
+    cutoff = dt.date.today() - dt.timedelta(days=lookback_days)
+    cur.execute(
+        """
+        WITH latest_snap AS (
+            SELECT DISTINCT ON (s.event_slug, s.bucket_label)
+                s.event_slug,
+                s.bucket_label,
+                s.mid,
+                s.best_bid,
+                s.best_ask,
+                s.snapshot_at
+            FROM pm_market_snapshots s
+            ORDER BY s.event_slug, s.bucket_label, s.snapshot_at DESC
+        )
+        SELECT
+            e.event_slug,
+            e.target_date,
+            sn.slug AS station_slug,
+            b.bucket_label,
+            b.lo_f,
+            b.hi_f,
+            COALESCE(
+                ls.mid,
+                (ls.best_bid + ls.best_ask) / 2.0,
+                ls.best_bid,
+                ls.best_ask
+            )::float8 AS prob_raw,
+            o.observed_max_f::float8,
+            ls.snapshot_at
+        FROM pm_events  e
+        JOIN pm_buckets b ON b.event_slug = e.event_slug
+        LEFT JOIN latest_snap ls
+                          ON ls.event_slug   = b.event_slug
+                         AND ls.bucket_label = b.bucket_label
+        JOIN stations  sn ON sn.station_id = e.station_id
+        JOIN observations o
+                          ON o.station_id   = e.station_id
+                         AND o.obs_date     = e.target_date
+                         AND o.observed_max_f IS NOT NULL
+        WHERE e.target_date <= CURRENT_DATE
+          AND e.target_date >= %s
+          AND sn.slug = ANY(%s)
+        ORDER BY e.event_slug, b.bucket_label
+        """,
+        (cutoff, list(station_slugs)),
     )
     return list(cur.fetchall())
 
@@ -204,7 +273,14 @@ def run_calibration(
     paths.reports.mkdir(parents=True, exist_ok=True)
 
     with with_conn() as conn, conn.cursor() as cur:
-        rows = _fetch_resolved_buckets(cur, model_id, station_slugs, lookback_days)
+        if model_id == MODEL_MARKET_MID:
+            rows = _fetch_market_baseline_buckets(
+                cur, station_slugs, lookback_days
+            )
+        else:
+            rows = _fetch_resolved_buckets(
+                cur, model_id, station_slugs, lookback_days
+            )
         forecast_metrics = _fetch_forecast_source_metrics(
             cur, station_slugs, lookback_days
         )
@@ -237,7 +313,9 @@ def run_calibration(
         )
         bb = _bucket_bounds_from_row(label, lo, hi)
         e["buckets"].append(bb)
-        e["probs"][label] = float(prob)
+        # ``prob`` may be NULL for the market baseline when no snapshot exists
+        # for that bucket; treat as 0 so it falls out during renormalisation.
+        e["probs"][label] = 0.0 if prob is None else float(prob)
 
     event_scores: list[EventScore] = []
     for slug, e in by_event.items():

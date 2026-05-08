@@ -1,13 +1,24 @@
-"""Station registry: city slug -> ASOS / GHCN station metadata.
+"""Station registry: internal slug -> ASOS / GHCN metadata.
 
-Keep this list in sync with NOAA GHCN-Daily station IDs and the Polymarket
-city-slug naming convention used by Gamma (``highest-temperature-in-{slug}-on-...``).
+Slugs and ``polymarket_city_slug`` match Polymarket Gamma event URLs, e.g.
+``highest-temperature-in-dallas-on-may-8-2026``.
+
+**US daily high-temperature markets** (Polymarket tag ``daily-temperature`` /
+``highest-temperature``, closed=false snapshot) currently list 51 global cities;
+this registry includes the **11 United States** locations only. ICAO and
+``ghcn_id`` are chosen to align with each market's published resolution station
+(Wunderground airport names in the event description) so GHCN-D and NWS
+gridpoint data track the same site where possible.
+
+To add international cities later, extend ``_STATIONS`` and keep
+``polymarket_city_slug`` identical to the Gamma slug segment after
+``highest-temperature-in-``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Final, FrozenSet
 
 
 @dataclass(frozen=True)
@@ -22,38 +33,143 @@ class Station:
     display_name: str
 
 
+# (slug, polymarket_city_slug, icao, ghcn_id, lat, lon, tz, display_name)
+_STATIONS: tuple[tuple[str, str, str, str, float, float, str, str], ...] = (
+    (
+        "atlanta",
+        "atlanta",
+        "KATL",
+        "USW00013874",
+        33.6297,
+        -84.4422,
+        "America/New_York",
+        "Atlanta (Hartsfield-Jackson)",
+    ),
+    (
+        "austin",
+        "austin",
+        "KAUS",
+        "USW00013904",
+        30.1831,
+        -97.6800,
+        "America/Chicago",
+        "Austin (Bergstrom)",
+    ),
+    (
+        "chicago",
+        "chicago",
+        "KORD",
+        "USW00094846",
+        41.9603,
+        -87.9317,
+        "America/Chicago",
+        "Chicago (O'Hare)",
+    ),
+    (
+        "dallas",
+        "dallas",
+        "KDAL",
+        "USW00013960",
+        32.8383,
+        -96.8358,
+        "America/Chicago",
+        "Dallas (Love Field)",
+    ),
+    (
+        "denver",
+        "denver",
+        "KBKF",
+        "USW00023036",
+        39.7167,
+        -104.7500,
+        "America/Denver",
+        "Denver area (Buckley Field)",
+    ),
+    (
+        "houston",
+        "houston",
+        "KHOU",
+        "USW00012918",
+        29.6458,
+        -95.2822,
+        "America/Chicago",
+        "Houston (Hobby)",
+    ),
+    (
+        "los-angeles",
+        "los-angeles",
+        "KLAX",
+        "USW00023174",
+        33.9381,
+        -118.3867,
+        "America/Los_Angeles",
+        "Los Angeles (LAX)",
+    ),
+    (
+        "miami",
+        "miami",
+        "KMIA",
+        "USW00012839",
+        25.7881,
+        -80.3169,
+        "America/New_York",
+        "Miami (International)",
+    ),
+    (
+        "nyc",
+        "nyc",
+        "KLGA",
+        "USW00014732",
+        40.7794,
+        -73.8803,
+        "America/New_York",
+        "New York City (LaGuardia)",
+    ),
+    (
+        "san-francisco",
+        "san-francisco",
+        "KSFO",
+        "USW00023234",
+        37.6197,
+        -122.3656,
+        "America/Los_Angeles",
+        "San Francisco (SFO)",
+    ),
+    (
+        "seattle",
+        "seattle",
+        "KSEA",
+        "USW00024233",
+        47.4447,
+        -122.3144,
+        "America/Los_Angeles",
+        "Seattle (Sea-Tac)",
+    ),
+)
+
 REGISTRY: Dict[str, Station] = {
-    "nyc": Station(
-        slug="nyc",
-        polymarket_city_slug="nyc",
-        icao="KLGA",
-        ghcn_id="USW00014732",
-        lat=40.7794,
-        lon=-73.8803,
-        tz="America/New_York",
-        display_name="New York City (LaGuardia)",
-    ),
-    "chicago": Station(
-        slug="chicago",
-        polymarket_city_slug="chicago",
-        icao="KORD",
-        ghcn_id="USW00094846",
-        lat=41.9742,
-        lon=-87.9073,
-        tz="America/Chicago",
-        display_name="Chicago (O'Hare)",
-    ),
-    "los-angeles": Station(
-        slug="los-angeles",
-        polymarket_city_slug="los-angeles",
-        icao="KLAX",
-        ghcn_id="USW00023174",
-        lat=33.9425,
-        lon=-118.4081,
-        tz="America/Los_Angeles",
-        display_name="Los Angeles (LAX)",
-    ),
+    row[0]: Station(
+        slug=row[0],
+        polymarket_city_slug=row[1],
+        icao=row[2],
+        ghcn_id=row[3],
+        lat=row[4],
+        lon=row[5],
+        tz=row[6],
+        display_name=row[7],
+    )
+    for row in _STATIONS
 }
+
+# Polymarket US daily-temperature city slugs (subset of global ``daily-temperature`` tag).
+US_WEATHER_MARKET_SLUGS: Final[FrozenSet[str]] = frozenset(REGISTRY.keys())
+
+_DEFAULT_STATION_LIST: Final[str] = ",".join(sorted(REGISTRY.keys()))
+
+
+def default_station_csv() -> str:
+    """Comma-separated slugs used when ``WEATHER_STATIONS`` is unset."""
+    return _DEFAULT_STATION_LIST
 
 
 def get(slug: str) -> Station:

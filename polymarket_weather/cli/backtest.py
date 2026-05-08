@@ -1,0 +1,117 @@
+"""Replay historical ``pm_market_snapshots`` and report PnL after fees.
+
+Realised PnL is settled against ``observations`` (preferring
+``wunderground:historical``). The model's bucket_probs are read from history
+with ``run_time <= snapshot_at`` to avoid look-ahead.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+
+from ..backtest import (
+    render_backtest_markdown,
+    replay_backtest,
+    write_backtest_report,
+)
+from ..models.baseline import MODEL_M1
+from ..models.m2_postprocessed_ensemble import MODEL_M2
+from ..strategy.edge import FeeSchedule
+from ..strategy.sizing import (
+    DEFAULT_MIN_EDGE_PER_DOLLAR,
+    CapsConfig,
+)
+from ._common import add_common_args, configure_logging, parse_stations
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__)
+    add_common_args(p, with_date=False)
+    p.add_argument(
+        "--start", type=lambda s: dt.date.fromisoformat(s), required=True
+    )
+    p.add_argument(
+        "--end", type=lambda s: dt.date.fromisoformat(s),
+        default=dt.date.today(),
+    )
+    p.add_argument(
+        "--model", default=MODEL_M2,
+        help=f"Bucket-prob model_id (e.g. {MODEL_M1}, {MODEL_M2}).",
+    )
+    p.add_argument(
+        "--strategy", choices=("taker", "maker", "both"), default="both"
+    )
+    p.add_argument("--bankroll", type=float, default=500.0)
+    p.add_argument("--per-bucket-cap", type=float, default=5.0)
+    p.add_argument("--per-event-cap", type=float, default=20.0)
+    p.add_argument("--per-day-cap", type=float, default=100.0)
+    p.add_argument("--per-portfolio-cap", type=float, default=500.0)
+    p.add_argument("--kelly-fraction", type=float, default=0.25)
+    p.add_argument(
+        "--min-edge-cents", type=float,
+        default=DEFAULT_MIN_EDGE_PER_DOLLAR * 100.0,
+    )
+    p.add_argument(
+        "--target-spread", type=float, default=0.04,
+    )
+    p.add_argument(
+        "--print-only", action="store_true",
+        help="Print to stdout without writing a markdown file.",
+    )
+    args = p.parse_args()
+    configure_logging(args.verbose)
+
+    caps = CapsConfig(
+        bankroll_usd=args.bankroll,
+        per_bucket_usd=args.per_bucket_cap,
+        per_event_usd=args.per_event_cap,
+        per_day_usd=args.per_day_cap,
+        per_portfolio_usd=args.per_portfolio_cap,
+        kelly_fraction=args.kelly_fraction,
+        min_edge_per_dollar=args.min_edge_cents / 100.0,
+    )
+
+    result = replay_backtest(
+        model_id=args.model,
+        station_slugs=parse_stations(args.station),
+        start=args.start,
+        end=args.end,
+        caps=caps,
+        fees=FeeSchedule(),
+        strategy=args.strategy,
+        target_spread=args.target_spread,
+    )
+
+    if args.print_only:
+        print(render_backtest_markdown(
+            result,
+            model_id=args.model,
+            start=args.start,
+            end=args.end,
+            strategy=args.strategy,
+            caps=caps,
+        ))
+        return
+
+    path = write_backtest_report(
+        result,
+        model_id=args.model,
+        start=args.start,
+        end=args.end,
+        strategy=args.strategy,
+        caps=caps,
+    )
+    print(
+        f"Wrote {path}\n"
+        f"  taker_pnl=${result.pnl_taker_usd:+.2f} "
+        f"maker_pnl=${result.pnl_maker_usd:+.2f} "
+        f"net=${result.pnl_taker_usd + result.pnl_maker_usd:+.2f} "
+        f"taker_fills={len(result.fills_taker)} "
+        f"maker_fills={len(result.fills_maker)} "
+        f"events_resolved={result.n_events_resolved}"
+    )
+
+
+if __name__ == "__main__":
+    main()

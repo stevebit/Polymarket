@@ -42,12 +42,13 @@ There is no background bot. Anything that moves money or posts orders requires a
 ## Weather research package
 
 A separate package, `polymarket_weather/`, provides a **read-only** research
-toolkit for Polymarket daily-temperature events (NYC / Chicago / LA today,
-extensible). It pulls multi-model forecasts (Open-Meteo, NWS), NOAA GHCN-D
-observations, and Polymarket bucket probabilities into Azure Postgres, fits
-two baseline distributional models, and writes a calibration report to
-`reports/`. **It stops at calibration** — no order placement, no bet sizing,
-no scheduler.
+toolkit for Polymarket daily-temperature events (all 11 US cities currently
+listed on Polymarket's daily temperature board). It pulls multi-model forecasts
+(Open-Meteo, NWS), NOAA GHCN-D observations, Weather Underground historical
+observations (for source parity checks), and Polymarket bucket probabilities
+into Azure Postgres, fits two baseline distributional models, and writes
+calibration/parity reports to `reports/`. **It stops at calibration** — no
+order placement, no bet sizing, no scheduler.
 
 ### Setup
 
@@ -55,7 +56,7 @@ no scheduler.
 2. Add to `.env` (see `.env.example`):
    - `WEATHER_POSTGRES_URL` (libpq URL, password URL-encoded, `sslmode=require`)
    - `NOAA_Token_ID` (NOAA Climate Data Online token; note the casing — [request token](https://www.ncdc.noaa.gov/cdo-web/token))
-   - `WEATHER_STATIONS=nyc,chicago,los-angeles`
+   - `WEATHER_STATIONS` (optional): omit or leave blank for all **11 US** Polymarket daily-temperature cities; otherwise comma-separated slugs such as `nyc,chicago`.
    - `WEATHER_HTTP_UA=polymarket-weather (contact: <your-email>)`
 3. `pip install -e .` — installs `psycopg`, `httpx`, `pandas`, `numpy`,
    `matplotlib`, `scipy` alongside the existing CLOB deps.
@@ -67,12 +68,19 @@ python -m polymarket_weather.cli.migrate
 python -m polymarket_weather.cli.discover --days-ahead 7
 python -m polymarket_weather.cli.ingest_forecasts --past-days 7 --forecast-days 8
 python -m polymarket_weather.cli.ingest_observations --days 30
+python -m polymarket_weather.cli.ingest_resolution_observations --days 30
 python -m polymarket_weather.cli.refresh_climatology
 python -m polymarket_weather.cli.predict --days-ahead 7
 python -m polymarket_weather.cli.calibrate --lookback-days 30
+python -m polymarket_weather.cli.parity_report --lookback-days 365
+python -m polymarket_weather.cli.dashboard --lookback-days 365
 ```
 
 The calibration report (markdown + reliability PNG) lands under `reports/`,
 which is gitignored. Re-running any CLI is idempotent — every write goes
 through `INSERT ... ON CONFLICT DO UPDATE`. See `Agents.md` for the full
 schema, env-key reference, and safety boundaries.
+
+`dashboard` writes a standalone `reports/weather_dashboard.html` with a US map
+of stations; click a station marker (or use the selector) to view its raw
+observation + forecast timeseries overlays.
