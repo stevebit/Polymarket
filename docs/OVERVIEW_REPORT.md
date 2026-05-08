@@ -26,6 +26,8 @@ Polymarket weather work is **stateful**: many stations, many days, many forecast
 
 `WEATHER_POSTGRES_URL` in `.env` points at your Azure Database for PostgreSQL flexible server; migrations live under `migrations/`.
 
+**Note:** `.gitignore` uses `/data/` (repo root only) so ad-hoc download folders stay untracked while **`polymarket_weather/data/`** (Python ingest modules) remains in git. Orchestrator logs go under `logs/`, which is ignored.
+
 ---
 
 ## 3. Schema evolution (migrations)
