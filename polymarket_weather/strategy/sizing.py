@@ -92,6 +92,22 @@ def _kelly_fraction_sell(p_model: float, price: float) -> float:
 # ---------------------------------------------------------------------------
 
 
+def _exposure_per_share(edge: Edge) -> float:
+    """Real loss-if-wrong per share, i.e. the dollar amount actually at risk.
+
+    For a YES BUY at price ``p``: if YES loses, the buyer loses ``p`` per
+    share. For a YES SELL at price ``p``: that is equivalent to buying NO at
+    ``1 - p``, so if YES wins (= NO loses) the seller loses ``1 - p`` per
+    share. Caps must be sized against this exposure, not the YES-side
+    notional, otherwise a sell at ``p = 0.001`` looks like ``shares * 0.001``
+    of "notional" while actually putting ``shares * 0.999`` of capital at
+    risk.
+    """
+    if edge.action in (Action.TAKER_BUY, Action.MAKER_BUY):
+        return edge.price
+    return 1.0 - edge.price
+
+
 def size_edge(
     edge: Edge,
     *,
@@ -99,13 +115,23 @@ def size_edge(
     state: CapsState = CapsState(),
     tick_size: float = DEFAULT_TICK_SIZE,
 ) -> SizedOrder | None:
-    """Return a sized order, or None if edge is too small / caps exhausted."""
-    # Filter by minimum-edge threshold first.
+    """Return a sized order, or None if edge is too small / caps exhausted.
+
+    Caps are interpreted as **maximum loss-if-wrong dollars** per scope, which
+    matches how a tiny-bankroll trader thinks about risk: "I am willing to
+    lose at most ``per_bucket_usd`` on any single bucket". For YES buys this
+    equals ``shares * price``; for YES sells (= NO buys) it equals
+    ``shares * (1 - price)``. See :func:`_exposure_per_share`.
+    """
     if edge.ev_per_share <= 0:
         return None
     if edge.price <= 0 or edge.price >= 1:
         return None
-    edge_per_dollar = edge.ev_per_share / edge.price
+
+    # Edge per dollar at risk: EV / exposure_per_share, NOT EV / price. The
+    # threshold then applies uniformly across buy and sell sides.
+    exposure_per_share = _exposure_per_share(edge)
+    edge_per_dollar = edge.ev_per_share / exposure_per_share
     if edge_per_dollar < caps.min_edge_per_dollar:
         return None
 
@@ -118,7 +144,8 @@ def size_edge(
 
     target_dollars = caps.kelly_fraction * f_star * caps.bankroll_usd
 
-    # Apply caps in increasing order of restrictiveness.
+    # Apply caps in increasing order of restrictiveness. Each cap is a
+    # max-loss-if-wrong dollar amount.
     binding = "kelly"
     if target_dollars > caps.per_bucket_usd - state.used_per_bucket:
         target_dollars = max(0.0, caps.per_bucket_usd - state.used_per_bucket)
@@ -135,11 +162,15 @@ def size_edge(
         )
         binding = "per_portfolio"
 
-    shares = int(target_dollars // edge.price)
+    shares = int(target_dollars // exposure_per_share)
     if shares < caps.min_order_shares:
         return None
 
-    notional = shares * edge.price
+    # ``notional_usd`` is the loss-if-wrong figure for cap accounting; cash
+    # outlay at order placement (= shares * price for buys, 0 cash up front
+    # for sells with proceeds = shares * price) is a separate matter handled
+    # by the order-placement layer.
+    notional = shares * exposure_per_share
     expected_value = shares * edge.ev_per_share
     return SizedOrder(
         edge=edge,
