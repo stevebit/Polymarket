@@ -298,11 +298,54 @@ def build_demo_payload() -> dict:
     )
 
 
+def build_alt_payload() -> dict:
+    """A second synthetic run with worse calibration / smaller edge.
+
+    Intended for offline smoke-testing the multi-run compare dashboard.
+    Produced by perturbing the primary fixture: shrink shares slightly,
+    flip half the wins to losses, halve EV claims.
+    """
+    base = build_demo_payload()
+    base["meta"]["model_id"] = "m1_ensemble_gaussian"
+    for fills_key in ("fills_taker", "fills_maker"):
+        for i, f in enumerate(base[fills_key]):
+            f["shares"] = max(1, int(f["shares"] * 0.7))
+            f["expected_pnl_per_share_at_post"] = (
+                (f.get("expected_pnl_per_share_at_post") or 0.0) * 0.5
+            )
+            if i % 2 == 1 and f.get("settled"):
+                # Force a loss: realised label != bucket for buys, == for sells.
+                if f["side"].endswith("_buy"):
+                    f["realised_label"] = "outside-mock"
+                    f["realised_pnl_usd"] = -f["price"] * f["shares"]
+                    f["won"] = False
+                else:
+                    f["realised_label"] = f["bucket_label"]
+                    f["realised_pnl_usd"] = -(1 - f["price"]) * f["shares"]
+                    f["won"] = False
+    # Recompute summary totals for the alt payload.
+    pnl_taker = sum(f["realised_pnl_usd"] for f in base["fills_taker"])
+    pnl_maker = sum(f["realised_pnl_usd"] for f in base["fills_maker"])
+    fees = sum(f["fee_usd"] for f in base["fills_taker"])
+    base["summary"]["pnl_taker_usd"] = pnl_taker
+    base["summary"]["pnl_maker_usd"] = pnl_maker
+    base["summary"]["fees_paid_usd"] = fees
+    base["summary"]["net_pnl_usd"] = pnl_taker + pnl_maker - fees
+    return base
+
+
+ALT_FIXTURE_PATH = REPO_ROOT / "docs" / "fixtures" / "backtest_smoke_alt.json"
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--write-fixture", action="store_true",
         help=f"Overwrite {FIXTURE_PATH.relative_to(REPO_ROOT)} with the demo payload.",
+    )
+    p.add_argument(
+        "--write-alt-fixture", action="store_true",
+        help=f"Also write {ALT_FIXTURE_PATH.relative_to(REPO_ROOT)} for compare-mode demos.",
     )
     args = p.parse_args()
 
@@ -329,6 +372,12 @@ def main() -> None:
         FIXTURE_PATH.parent.mkdir(parents=True, exist_ok=True)
         FIXTURE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         print(f"Wrote fixture {FIXTURE_PATH}")
+
+    if args.write_alt_fixture:
+        alt = build_alt_payload()
+        ALT_FIXTURE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ALT_FIXTURE_PATH.write_text(json.dumps(alt, indent=2), encoding="utf-8")
+        print(f"Wrote alt fixture {ALT_FIXTURE_PATH}")
 
 
 if __name__ == "__main__":

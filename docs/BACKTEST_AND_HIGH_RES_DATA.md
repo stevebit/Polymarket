@@ -45,6 +45,31 @@ python -m polymarket_weather.cli.backtest_dashboard --from-json reports/backtest
   --output reports/backtest_run.html
 ```
 
+The single-run dashboard shows equity (gross + net + drawdown), a reliability
+diagram on the **acted-on subset only**, an EV-vs-realised per-share scatter
+with a fit line, a station × lead net-PnL heatmap, a tail-vs-centre hit-rate
+bar, fill-rate / coverage tiles, top winners / losers by event, and a recent-
+fills table with realised labels.
+
+To **compare two or more runs** (e.g. M1 vs M2 with the same window), pass
+``--from-json`` repeatedly:
+
+```powershell
+python -m polymarket_weather.cli.backtest --start 2025-01-01 --end 2025-06-01 `
+  --model m1_ensemble_gaussian --export-json reports/m1.json
+python -m polymarket_weather.cli.backtest --start 2025-01-01 --end 2025-06-01 `
+  --model m2_postprocessed_ensemble --export-json reports/m2.json
+
+python -m polymarket_weather.cli.backtest_dashboard `
+  --from-json reports/m1.json --label "M1" `
+  --from-json reports/m2.json --label "M2" `
+  --output reports/compare.html
+```
+
+The compare dashboard overlays net equity curves and reliability diagrams,
+plus grouped per-station and per-lead bar charts so you can see *where* one
+model's edge differs from the other.
+
 ## 2. Daily max vs higher frequency
 
 Polymarket contracts still pay on **one number per local calendar day**: the
