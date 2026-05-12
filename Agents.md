@@ -64,6 +64,16 @@ at [docs/PHASE6_GO_LIVE_CHECKLIST.md](docs/PHASE6_GO_LIVE_CHECKLIST.md).
 
 For a **narrative overview** of what was built and why, see
 [docs/OVERVIEW_REPORT.md](docs/OVERVIEW_REPORT.md).
+
+For **backtest mechanics**, snapshot subsampling, JSON export, and the
+**hourly / neighbor-station** ingest path, see
+[docs/BACKTEST_AND_HIGH_RES_DATA.md](docs/BACKTEST_AND_HIGH_RES_DATA.md).
+
+To **copy Azure Postgres into a local Windows Postgres** instance for browsing
+with pgAdmin/DBeaver, see
+[docs/LOCAL_POSTGRES_SETUP.md](docs/LOCAL_POSTGRES_SETUP.md) and
+`scripts/sync_azure_weather_to_local.ps1`.
+
 Future agents: do not enable `WEATHER_AUTOMATION_ENABLED=1` on the
 user's behalf — that is a manual decision after the checklist is green.
 
@@ -87,11 +97,11 @@ postgresql://weatheradmin:<urlencoded-pw>@<server>.postgres.database.azure.com:5
 ### Schema and migrations
 
 - SQL files live in `migrations/` (currently `001_init.sql` →
-  `004_orders_fills.sql`).
+  `005_hourly_observations.sql`).
 - `polymarket_weather/db.py` discovers and applies any unapplied numbered
   files in a transaction each, recording state in `schema_migrations`.
 - Tables: `stations`, `pm_events`, `pm_buckets`, `pm_market_snapshots`,
-  `forecasts`, `forecast_members`, `observations`, `climatology`,
+  `forecasts`, `forecast_members`, `hourly_observations`, `observations`, `climatology`,
   `predictions`, `bucket_probs`, `calibration_runs`, `postprocess_coefs`,
   `paper_trades`, `orders`, `fills`, `daily_pnl`. All upserts are idempotent.
 - Stations are seeded from `polymarket_weather/stations.py` on first run.
@@ -109,6 +119,7 @@ postgresql://weatheradmin:<urlencoded-pw>@<server>.postgres.database.azure.com:5
 | `ingest_forecasts` | Open-Meteo (multi-model + bestmatch) + NWS hourly + NWS daily + NBM v5.0 station bulletins. |
 | `ingest_ensembles` | Open-Meteo ensemble member traces (GFS-ENS / IFS-ENS / GEM-ENS) into `forecast_members`. |
 | `ingest_live_observations` | NWS station observations + Iowa Mesonet ASOS for today-so-far feature. |
+| `ingest_hourly_observations` | Iowa Mesonet ASOS **hourly** backfill into `hourly_observations` for primary + optional **neighbor** ICAOs per city (`NEIGHBOR_ICAOS_BY_SLUG`). |
 | `ingest_observations` | NOAA GHCN-Daily TMAX backfill / incremental. |
 | `ingest_resolution_observations` | Weather Underground/weather.com historical Tmax ingest for Polymarket resolution-source parity checks. |
 | `refresh_climatology` | Per-station day-of-year TMAX climatology. |
@@ -117,7 +128,8 @@ postgresql://weatheradmin:<urlencoded-pw>@<server>.postgres.database.azure.com:5
 | `calibrate` | Backtest log-loss / Brier / reliability over resolved events; writes `reports/calibration_<run_id>.md` and a `calibration_runs` row. `--include-market` adds the market-implied baseline. |
 | `parity_report` | NOAA vs WU source-parity diagnostics over overlapping station/day observations; writes `reports/parity_<timestamp>.md`. |
 | `recommend` | **Read-only** daily fee-aware recommendations: per bucket, taker / maker EV, neg-risk projection, fractional-Kelly size against tiny-bankroll caps. Writes `reports/recommendations_<date>.md`. |
-| `backtest` | Replay `pm_market_snapshots` chronologically with leakage-controlled fills + queue-model maker simulation; writes `reports/backtest_<run>.md`. |
+| `backtest` | Replay `pm_market_snapshots` chronologically with leakage-controlled fills + maker-through-book model; writes `reports/backtest_<run>.md`. Supports `--take-every-n-snapshots`, `--export-json`, equity curve + snapshot spacing stats in the JSON. |
+| `backtest_dashboard` | Static Plotly HTML from `--export-json` output (equity, PnL by station/lead, fill table). |
 | `paper` | `submit` writes recommendations to `paper_trades`, `settle` marks resolved trades against WU outcomes, `summary` reports realised PnL / fees / hit rate. |
 | `run_loop` | Orchestrator: ingest delta → predict → recommend → reconcile → place/paper. `--mode paper` is read-only; `--mode live` is gated by automation envs (see Safety boundary). |
 | `live_report` | **Read-only** morning review: open orders, fills, daily PnL, paper-trade realised/expected ratio, latest calibration per model, open exposure by event, plus the Phase 6 review checklist. Writes `reports/live_<date>.md`. |

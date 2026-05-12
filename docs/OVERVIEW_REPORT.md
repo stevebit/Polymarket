@@ -135,10 +135,13 @@ python -m polymarket_weather.cli.discover --days-ahead 7
 python -m polymarket_weather.cli.ingest_forecasts
 python -m polymarket_weather.cli.ingest_ensembles
 python -m polymarket_weather.cli.ingest_live_observations
+python -m polymarket_weather.cli.ingest_hourly_observations --start 2024-01-01 --end 2024-12-31
 python -m polymarket_weather.cli.fit_postprocess
 python -m polymarket_weather.cli.predict
 python -m polymarket_weather.cli.calibrate --include-market
 python -m polymarket_weather.cli.recommend
+python -m polymarket_weather.cli.backtest --start 2025-01-01 --end 2025-06-01 --export-json reports/backtest_run.json
+python -m polymarket_weather.cli.backtest_dashboard --from-json reports/backtest_run.json
 python -m polymarket_weather.cli.run_loop --mode paper
 python -m polymarket_weather.cli.live_report
 ```
@@ -150,7 +153,8 @@ Adjust flags (`--station`, `--days-ahead`, `--no-ingest`, etc.) per `Agents.md` 
 ## 11. Known limitations and honest next steps
 
 - **M1** can show **inflated tail EV**; **M2** needs enough history in `bucket_probs` before `calibrate --model m2_postprocessed_ensemble` has a non-zero sample — treat early paper PnL as **diagnostic**, not proof of edge.
-- **Backtest maker fills** are limited by snapshot frequency; live maker performance may differ.
+- **Backtest maker fills** are limited by snapshot frequency; live maker performance may differ. Use `snapshot_stats`, `--take-every-n-snapshots`, and [BACKTEST_AND_HIGH_RES_DATA.md](BACKTEST_AND_HIGH_RES_DATA.md) to interpret runs.
+- **`hourly_observations`** is stored for features and exploration; **EMOS/M2** still train on daily pairs until you add derived daily scalars from hourly (see that doc).
 - **Weekly drawdown auto kill-switch** from the plan is not fully automated as a separate watcher — manual `WEATHER_KILL_SWITCH` plus caps is the current safety posture; extend if you want hard automation.
 - **Rewards economics** (`rebateRate` interpretation) may need a tiny live probe trade once you are comfortable with caps.
 
