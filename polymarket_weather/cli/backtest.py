@@ -10,7 +10,11 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 
+from pathlib import Path
+
 from ..backtest import (
+    backtest_result_to_dict,
+    export_backtest_json,
     render_backtest_markdown,
     replay_backtest,
     write_backtest_report,
@@ -59,6 +63,19 @@ def main() -> None:
         "--print-only", action="store_true",
         help="Print to stdout without writing a markdown file.",
     )
+    p.add_argument(
+        "--take-every-n-snapshots",
+        type=int,
+        default=1,
+        help="Replay every Nth snapshot in time order (1 = all). Reduces runtime "
+        "and approximates coarser book updates for maker stress tests.",
+    )
+    p.add_argument(
+        "--export-json",
+        type=Path,
+        default=None,
+        help="Also write a JSON bundle for backtest_dashboard / external analysis.",
+    )
     args = p.parse_args()
     configure_logging(args.verbose)
 
@@ -72,16 +89,31 @@ def main() -> None:
         min_edge_per_dollar=args.min_edge_cents / 100.0,
     )
 
+    fees = FeeSchedule()
     result = replay_backtest(
         model_id=args.model,
         station_slugs=parse_stations(args.station),
         start=args.start,
         end=args.end,
         caps=caps,
-        fees=FeeSchedule(),
+        fees=fees,
         strategy=args.strategy,
         target_spread=args.target_spread,
+        take_every_n_snapshots=args.take_every_n_snapshots,
     )
+
+    if args.export_json:
+        payload = backtest_result_to_dict(
+            result,
+            model_id=args.model,
+            start=args.start,
+            end=args.end,
+            strategy=args.strategy,
+            caps=caps,
+            fees=fees,
+        )
+        export_backtest_json(args.export_json, payload)
+        print(f"Wrote JSON {args.export_json}")
 
     if args.print_only:
         print(render_backtest_markdown(

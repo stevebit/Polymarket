@@ -21,17 +21,22 @@ snapshot_at)`` group:
    pulling the realised TMAX from ``observations`` (preferring
    ``wunderground:historical``). PnL = shares * (1{won} - cost) - fees.
 
-Output: ``BacktestResult`` with per-strategy PnL, realised log-loss, and
-fill metrics. The CLI ``cli.backtest`` writes a markdown report.
+Output: ``BacktestResult`` with per-strategy PnL, realised log-loss, fill
+metrics, **snapshot spacing stats**, **gross equity curve**, and optional
+JSON export for ``cli.backtest_dashboard``. The CLI ``cli.backtest`` writes a
+markdown report and can ``--export-json`` / ``--take-every-n-snapshots``.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import math
+import statistics
 from dataclasses import dataclass, field
-from typing import Iterable, Literal
+from pathlib import Path
+from typing import Any, Iterable, Literal
 
 from . import config
 from .db import with_conn
@@ -70,6 +75,7 @@ class _OpenOrder:
     """Maker order that hasn't filled yet. Tracked across snapshots."""
 
     event_slug: str
+    station_slug: str
     bucket_label: str
     side: Action
     price: float
@@ -81,6 +87,7 @@ class _OpenOrder:
 @dataclass
 class _Fill:
     event_slug: str
+    station_slug: str
     bucket_label: str
     target_date: dt.date
     side: Action
@@ -110,6 +117,11 @@ class BacktestResult:
     by_station: dict[str, dict] = field(default_factory=dict)
     by_lead: dict[int, dict] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    # Richer diagnostics (Phase 4+ backtest environment improvements)
+    snapshot_stats: dict[str, Any] = field(default_factory=dict)
+    equity_curve: list[dict[str, Any]] = field(default_factory=list)
+    max_drawdown_usd: float = 0.0
+    take_every_n_snapshots: int = 1
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +314,73 @@ def _settle_maker(
     return pnl, "maker " + comment
 
 
+def _snapshot_time_stats(times: list[dt.datetime]) -> dict[str, Any]:
+    if len(times) < 2:
+        return {
+            "n_snapshots": len(times),
+            "median_hours_between": None,
+            "mean_hours_between": None,
+            "first_snapshot_at": times[0].isoformat() if times else None,
+            "last_snapshot_at": times[-1].isoformat() if times else None,
+        }
+    diffs = [
+        (times[i] - times[i - 1]).total_seconds() / 3600.0
+        for i in range(1, len(times))
+    ]
+    return {
+        "n_snapshots": len(times),
+        "median_hours_between": float(statistics.median(diffs)),
+        "mean_hours_between": float(sum(diffs) / len(diffs)),
+        "first_snapshot_at": times[0].isoformat(),
+        "last_snapshot_at": times[-1].isoformat(),
+    }
+
+
+def _build_equity_curve(
+    fills_taker: list[_Fill],
+    fills_maker: list[_Fill],
+    resolutions: dict[str, _ResolvedEvent],
+    *,
+    fees: FeeSchedule,
+) -> tuple[list[dict[str, Any]], float]:
+    """Cumulative **gross** settled PnL (payoff vs price) ordered by fill time.
+
+    Exchange taker fees are tracked separately in ``fees_paid_usd`` on the
+    result object; subtract them in dashboards if you want a net-of-fee curve.
+    """
+    events: list[tuple[dt.datetime, float, str]] = []
+    for f in fills_taker:
+        rev = resolutions.get(f.event_slug)
+        if rev is None or rev.realised_label is None:
+            continue
+        pnl, _ = _settle_taker(f, rev.realised_label)
+        events.append((f.filled_at, pnl, "taker"))
+    for f in fills_maker:
+        rev = resolutions.get(f.event_slug)
+        if rev is None or rev.realised_label is None:
+            continue
+        pnl, _ = _settle_maker(f, rev.realised_label, fee=fees.maker_fee)
+        events.append((f.filled_at, pnl, "maker"))
+    events.sort(key=lambda x: x[0])
+    curve: list[dict[str, Any]] = []
+    cum = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for ts, pnl, kind in events:
+        cum += pnl
+        peak = max(peak, cum)
+        max_dd = min(max_dd, cum - peak)
+        curve.append(
+            {
+                "filled_at": ts.isoformat(),
+                "kind": kind,
+                "incremental_pnl_usd": round(pnl, 6),
+                "cumulative_pnl_usd": round(cum, 6),
+            }
+        )
+    return curve, float(max_dd)
+
+
 # ---------------------------------------------------------------------------
 # Replay
 # ---------------------------------------------------------------------------
@@ -318,6 +397,7 @@ def replay_backtest(
     strategy: Strategy = "both",
     target_spread: float = 0.04,
     max_open_orders_per_event: int = 4,
+    take_every_n_snapshots: int = 1,
 ) -> BacktestResult:
     station_list = list(station_slugs) if station_slugs is not None else config.station_slugs()
 
@@ -343,6 +423,14 @@ def replay_backtest(
     for row in snapshots:
         grouped.setdefault(row[6], []).append(row)
 
+    snap_times = sorted(grouped.keys())
+    take_n = max(1, int(take_every_n_snapshots))
+    if take_n > 1:
+        snap_times = snap_times[::take_n]
+    snapshot_stats = _snapshot_time_stats(snap_times)
+    snapshot_stats["take_every_n_snapshots"] = take_n
+    snapshot_stats["total_snapshots_in_db"] = len(grouped)
+
     # Per-event open maker orders.
     open_orders: dict[str, list[_OpenOrder]] = {}
     fills_taker: list[_Fill] = []
@@ -356,7 +444,7 @@ def replay_backtest(
     # caps because it uses the live orchestrator code path.
     used_per_event: dict[str, float] = {}
 
-    for snap_time in sorted(grouped):
+    for snap_time in snap_times:
         rows = grouped[snap_time]
         rows_by_event: dict[str, dict] = {}
         for row in rows:
@@ -409,6 +497,7 @@ def replay_backtest(
                     fills_maker.append(
                         _Fill(
                             event_slug=ev,
+                            station_slug=o.station_slug,
                             bucket_label=o.bucket_label,
                             target_date=target,
                             side=o.side,
@@ -452,6 +541,7 @@ def replay_backtest(
                             fills_taker.append(
                                 _Fill(
                                     event_slug=ev,
+                                    station_slug=station,
                                     bucket_label=label,
                                     target_date=target,
                                     side=edge.action,
@@ -489,6 +579,7 @@ def replay_backtest(
                         open_orders.setdefault(ev, []).append(
                             _OpenOrder(
                                 event_slug=ev,
+                                station_slug=station,
                                 bucket_label=label,
                                 side=me.action,
                                 price=me.price,
@@ -533,10 +624,8 @@ def replay_backtest(
         if rev is None or rev.realised_label is None:
             continue
         pnl, _ = _settle_taker(f, rev.realised_label)
-        st = by_station.setdefault(
-            f.event_slug.split("-on-")[0].split("highest-temperature-in-")[-1],
-            {"n": 0, "pnl": 0.0, "fees": 0.0},
-        )
+        slug = f.station_slug or "unknown"
+        st = by_station.setdefault(slug, {"n": 0, "pnl": 0.0, "fees": 0.0})
         st["n"] += 1
         st["pnl"] += pnl
         lead = max(0, (f.target_date - f.posted_at.date()).days)
@@ -563,8 +652,19 @@ def replay_backtest(
         if ll_n > 0:
             realised_log_loss = ll_total / ll_n
 
+    equity_curve, max_dd = _build_equity_curve(
+        fills_taker, fills_maker, resolutions, fees=fees,
+    )
+    notes_bt: list[str] = []
+    if take_n > 1:
+        notes_bt.append(
+            f"Replay used every {take_n}th snapshot chronologically "
+            f"({len(snap_times)} of {len(grouped)} total) — coarser book path, "
+            "useful when stress-testing maker fill assumptions."
+        )
+
     return BacktestResult(
-        n_snapshots=len(grouped),
+        n_snapshots=len(snap_times),
         n_events_resolved=sum(1 for r in resolutions.values() if r.realised_label is not None),
         fills_taker=fills_taker,
         fills_maker=fills_maker,
@@ -574,8 +674,90 @@ def replay_backtest(
         realised_log_loss=realised_log_loss,
         by_station=by_station,
         by_lead=by_lead,
-        notes=[],
+        notes=notes_bt,
+        snapshot_stats=snapshot_stats,
+        equity_curve=equity_curve,
+        max_drawdown_usd=max_dd,
+        take_every_n_snapshots=take_n,
     )
+
+
+def _fill_to_dict(f: _Fill) -> dict[str, Any]:
+    return {
+        "event_slug": f.event_slug,
+        "station_slug": f.station_slug,
+        "bucket_label": f.bucket_label,
+        "target_date": f.target_date.isoformat(),
+        "side": f.side.value,
+        "price": f.price,
+        "shares": f.shares,
+        "p_model_at_post": f.p_model_at_post,
+        "posted_at": f.posted_at.isoformat(),
+        "filled_at": f.filled_at.isoformat(),
+    }
+
+
+def backtest_result_to_dict(
+    result: BacktestResult,
+    *,
+    model_id: str,
+    start: dt.date,
+    end: dt.date,
+    strategy: Strategy,
+    caps: CapsConfig,
+    fees: FeeSchedule | None = None,
+) -> dict[str, Any]:
+    """JSON-serialisable bundle for ``backtest_dashboard`` and external tooling."""
+    fees = fees or FeeSchedule()
+    net = result.pnl_taker_usd + result.pnl_maker_usd - result.fees_paid_usd
+    return {
+        "meta": {
+            "model_id": model_id,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "strategy": strategy,
+            "caps": {
+                "bankroll_usd": caps.bankroll_usd,
+                "per_bucket_usd": caps.per_bucket_usd,
+                "per_event_usd": caps.per_event_usd,
+                "per_day_usd": caps.per_day_usd,
+                "per_portfolio_usd": caps.per_portfolio_usd,
+                "kelly_fraction": caps.kelly_fraction,
+                "min_edge_per_dollar": caps.min_edge_per_dollar,
+            },
+            "fees": {"taker_fee": fees.taker_fee, "maker_fee": fees.maker_fee},
+        },
+        "summary": {
+            "n_snapshots": result.n_snapshots,
+            "n_events_resolved": result.n_events_resolved,
+            "n_fills_taker": len(result.fills_taker),
+            "n_fills_maker": len(result.fills_maker),
+            "pnl_taker_usd": result.pnl_taker_usd,
+            "pnl_maker_usd": result.pnl_maker_usd,
+            "fees_paid_usd": result.fees_paid_usd,
+            "net_pnl_usd": net,
+            "realised_log_loss": result.realised_log_loss,
+            "max_drawdown_usd": result.max_drawdown_usd,
+            "take_every_n_snapshots": result.take_every_n_snapshots,
+        },
+        "snapshot_stats": result.snapshot_stats,
+        "equity_curve": result.equity_curve,
+        "by_station": result.by_station,
+        "by_lead": result.by_lead,
+        "fills_taker": [_fill_to_dict(f) for f in result.fills_taker],
+        "fills_maker": [_fill_to_dict(f) for f in result.fills_maker],
+        "notes": result.notes,
+    }
+
+
+def export_backtest_json(
+    path: str | Path,
+    payload: dict[str, Any],
+) -> Path:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return p
 
 
 # ---------------------------------------------------------------------------
@@ -612,9 +794,39 @@ def render_backtest_markdown(
     lines.append(f"- Maker PnL: **${result.pnl_maker_usd:+.2f}** "
                  f"(n_fills = {len(result.fills_maker)})")
     lines.append(f"- Fees paid: ${result.fees_paid_usd:.2f}")
+    net = result.pnl_taker_usd + result.pnl_maker_usd - result.fees_paid_usd
     lines.append(
-        f"- Net PnL: **${result.pnl_taker_usd + result.pnl_maker_usd:+.2f}**"
+        f"- Net PnL (after taker fees): **${net:+.2f}** "
+        f"(gross ${result.pnl_taker_usd + result.pnl_maker_usd:+.2f} − fees)"
     )
+    if result.max_drawdown_usd != 0.0:
+        lines.append(
+            f"- Max drawdown on fee-adjusted equity path: **${result.max_drawdown_usd:+.2f}**"
+        )
+    if result.snapshot_stats:
+        lines.append("")
+        lines.append("## Snapshot coverage")
+        lines.append("")
+        ss = result.snapshot_stats
+        lines.append(f"- Snapshots used in replay: **{ss.get('n_snapshots', 0)}**")
+        lines.append(
+            f"- Total snapshot timestamps in DB window: **{ss.get('total_snapshots_in_db', 0)}**"
+        )
+        if ss.get("median_hours_between") is not None:
+            lines.append(
+                f"- Median hours between consecutive **used** snapshots: "
+                f"{ss['median_hours_between']:.2f} h"
+            )
+        if ss.get("take_every_n_snapshots", 1) > 1:
+            lines.append(
+                f"- Subsample: every **{ss['take_every_n_snapshots']}** snapshot(s)"
+            )
+    if result.notes:
+        lines.append("")
+        lines.append("## Notes")
+        lines.append("")
+        for n in result.notes:
+            lines.append(f"- {n}")
     if result.realised_log_loss is not None:
         lines.append(
             f"- Realised log-loss on resolved events: {result.realised_log_loss:.4f}"
