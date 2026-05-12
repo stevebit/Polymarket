@@ -18,7 +18,7 @@ To add international cities later, extend ``_STATIONS`` and keep
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Final, FrozenSet
+from typing import Dict, Final, FrozenSet, Tuple
 
 
 @dataclass(frozen=True)
@@ -146,6 +146,22 @@ _STATIONS: tuple[tuple[str, str, str, str, float, float, str, str], ...] = (
         "Seattle (Sea-Tac)",
     ),
 )
+
+# Additional METAR sites in the same metro (hourly_observations.site_icao).
+# Primary ICAO on each Station is still the Polymarket resolution airport.
+NEIGHBOR_ICAOS_BY_SLUG: Dict[str, Tuple[str, ...]] = {
+    "nyc": ("KJFK", "KEWR"),
+    "los-angeles": ("KBUR", "KVNY"),
+    "san-francisco": ("KOAK", "KSJC"),
+    "chicago": ("KMDW",),
+    "dallas": ("KDFW",),
+    "seattle": ("KBFI",),
+    "miami": ("KFLL",),
+    "houston": ("KIAH",),
+    "denver": ("KCOS",),
+    "atlanta": ("KPDK",),
+    "austin": ("KGTU",),
+}
 
 REGISTRY: Dict[str, Station] = {
     row[0]: Station(
