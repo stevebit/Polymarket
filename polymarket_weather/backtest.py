@@ -77,10 +77,13 @@ class _OpenOrder:
     event_slug: str
     station_slug: str
     bucket_label: str
+    bucket_lo_f: float | None
+    bucket_hi_f: float | None
     side: Action
     price: float
     shares: int
     p_model: float
+    expected_pnl_per_share_at_post: float
     posted_at: dt.datetime
 
 
@@ -89,13 +92,21 @@ class _Fill:
     event_slug: str
     station_slug: str
     bucket_label: str
+    bucket_lo_f: float | None
+    bucket_hi_f: float | None
     target_date: dt.date
     side: Action
     price: float
     shares: int
     p_model_at_post: float
+    expected_pnl_per_share_at_post: float
+    fee_usd: float
     posted_at: dt.datetime
     filled_at: dt.datetime
+    # Filled in by the settlement pass below. ``realised_label`` is None when
+    # we did not have a resolution observation for the event in the window.
+    realised_label: str | None = None
+    realised_pnl_usd: float = 0.0
 
 
 @dataclass
@@ -437,6 +448,17 @@ def replay_backtest(
     fills_maker: list[_Fill] = []
     fees_paid = 0.0
 
+    # Fill-rate / opportunity counters surfaced in snapshot_stats so dashboards
+    # can compute "did we trade often, and was it because of caps or no edge".
+    n_event_snapshots = 0
+    n_event_snapshots_with_probs = 0
+    n_bucket_opportunities = 0
+    n_taker_edges_found = 0
+    n_taker_filled = 0
+    n_maker_quotes_attempted = 0
+    n_maker_orders_posted = 0
+    n_maker_orders_filled = 0
+
     # Track caps state per *event* for the duration of the backtest. We do
     # not enforce per-day or per-portfolio caps in the backtest replay
     # because that introduces ordering-dependent path effects that obscure
@@ -468,12 +490,14 @@ def replay_backtest(
             target = ev_grp["target"]
             station = ev_grp["station"]
             bucket_labels = list(ev_grp["buckets"].keys())
+            n_event_snapshots += 1
             probs = _latest_probs_at(
                 history, event_slug=ev, bucket_labels=bucket_labels,
                 cutoff=snap_time,
             )
             if probs is None:
                 continue
+            n_event_snapshots_with_probs += 1
             coherent = coherent_model_probs(probs)
 
             # 1. Try to fill any open maker orders for this event with the
@@ -499,15 +523,20 @@ def replay_backtest(
                             event_slug=ev,
                             station_slug=o.station_slug,
                             bucket_label=o.bucket_label,
+                            bucket_lo_f=o.bucket_lo_f,
+                            bucket_hi_f=o.bucket_hi_f,
                             target_date=target,
                             side=o.side,
                             price=o.price,
                             shares=o.shares,
                             p_model_at_post=o.p_model,
+                            expected_pnl_per_share_at_post=o.expected_pnl_per_share_at_post,
+                            fee_usd=0.0,
                             posted_at=o.posted_at,
                             filled_at=snap_time,
                         )
                     )
+                    n_maker_orders_filled += 1
                 else:
                     still_open.append(o)
             open_orders[ev] = still_open
@@ -521,8 +550,11 @@ def replay_backtest(
             )
 
             for label, info in ev_grp["buckets"].items():
+                n_bucket_opportunities += 1
                 p_yes = coherent.get(label, 0.0)
                 yes_book = info["book"]
+                bucket_lo = info.get("lo")
+                bucket_hi = info.get("hi")
                 no_book = (
                     _no_book_from_yes(yes_book)
                     if (
@@ -536,23 +568,30 @@ def replay_backtest(
                     bb = BucketBook(yes=yes_book, no=no_book)
                     edge = best_taker_edge(p_yes, bb, fees=fees)
                     if edge is not None:
+                        n_taker_edges_found += 1
                         sized = size_edge(edge, caps=caps, state=state)
                         if sized is not None:
+                            fee_total = sized.shares * edge.fee_per_share
                             fills_taker.append(
                                 _Fill(
                                     event_slug=ev,
                                     station_slug=station,
                                     bucket_label=label,
+                                    bucket_lo_f=bucket_lo,
+                                    bucket_hi_f=bucket_hi,
                                     target_date=target,
                                     side=edge.action,
                                     price=edge.price,
                                     shares=sized.shares,
                                     p_model_at_post=p_yes,
+                                    expected_pnl_per_share_at_post=edge.ev_per_share,
+                                    fee_usd=fee_total,
                                     posted_at=snap_time,
                                     filled_at=snap_time,
                                 )
                             )
-                            fees_paid += sized.shares * edge.fee_per_share
+                            fees_paid += fee_total
+                            n_taker_filled += 1
                             state = CapsState(
                                 used_per_bucket=state.used_per_bucket,
                                 used_per_event=state.used_per_event + sized.notional_usd,
@@ -564,6 +603,7 @@ def replay_backtest(
                     n_open = len(open_orders.get(ev, []))
                     if n_open >= max_open_orders_per_event:
                         continue
+                    n_maker_quotes_attempted += 1
                     buy_e, sell_e = maker_quote_yes_within_rewards(
                         p_yes,
                         yes_book,
@@ -581,13 +621,17 @@ def replay_backtest(
                                 event_slug=ev,
                                 station_slug=station,
                                 bucket_label=label,
+                                bucket_lo_f=bucket_lo,
+                                bucket_hi_f=bucket_hi,
                                 side=me.action,
                                 price=me.price,
                                 shares=sized.shares,
                                 p_model=p_yes,
+                                expected_pnl_per_share_at_post=me.ev_per_share,
                                 posted_at=snap_time,
                             )
                         )
+                        n_maker_orders_posted += 1
                         state = CapsState(
                             used_per_bucket=state.used_per_bucket,
                             used_per_event=state.used_per_event + sized.notional_usd,
@@ -597,7 +641,9 @@ def replay_backtest(
 
             used_per_event[ev] = state.used_per_event
 
-    # Settle.
+    # Settle. Mutate each fill in-place with realised_label and realised_pnl_usd
+    # so JSON export and dashboards have per-fill outcomes without a second
+    # DB hit.
     pnl_taker = 0.0
     pnl_maker = 0.0
     by_station: dict[str, dict] = {}
@@ -608,30 +654,27 @@ def replay_backtest(
         if rev is None or rev.realised_label is None:
             continue
         pnl, _ = _settle_taker(f, rev.realised_label)
+        f.realised_label = rev.realised_label
+        f.realised_pnl_usd = pnl
         pnl_taker += pnl
+        slug = f.station_slug or "unknown"
+        st = by_station.setdefault(slug, {"n": 0, "pnl": 0.0, "fees": 0.0})
+        st["n"] += 1
+        st["pnl"] += pnl
+        st["fees"] += f.fee_usd
+        lead = max(0, (f.target_date - f.posted_at.date()).days)
+        ld = by_lead.setdefault(lead, {"n": 0, "pnl": 0.0})
+        ld["n"] += 1
+        ld["pnl"] += pnl
 
     for f in fills_maker:
         rev = resolutions.get(f.event_slug)
         if rev is None or rev.realised_label is None:
             continue
         pnl, _ = _settle_maker(f, rev.realised_label, fee=fees.maker_fee)
+        f.realised_label = rev.realised_label
+        f.realised_pnl_usd = pnl
         pnl_maker += pnl
-
-    # Per-station / per-lead rollups (taker only — maker requires more
-    # nuanced accounting to avoid double-counting).
-    for f in fills_taker:
-        rev = resolutions.get(f.event_slug)
-        if rev is None or rev.realised_label is None:
-            continue
-        pnl, _ = _settle_taker(f, rev.realised_label)
-        slug = f.station_slug or "unknown"
-        st = by_station.setdefault(slug, {"n": 0, "pnl": 0.0, "fees": 0.0})
-        st["n"] += 1
-        st["pnl"] += pnl
-        lead = max(0, (f.target_date - f.posted_at.date()).days)
-        ld = by_lead.setdefault(lead, {"n": 0, "pnl": 0.0})
-        ld["n"] += 1
-        ld["pnl"] += pnl
 
     # Realised log-loss across distinct (event, snapshot) combos: we look
     # at the *last* prediction we acted on per event.
@@ -655,6 +698,25 @@ def replay_backtest(
     equity_curve, max_dd = _build_equity_curve(
         fills_taker, fills_maker, resolutions, fees=fees,
     )
+
+    # Fill-rate diagnostics for "did we have edge but skip due to caps?"
+    snapshot_stats["n_event_snapshots"] = n_event_snapshots
+    snapshot_stats["n_event_snapshots_with_probs"] = n_event_snapshots_with_probs
+    snapshot_stats["n_bucket_opportunities"] = n_bucket_opportunities
+    snapshot_stats["n_taker_edges_found"] = n_taker_edges_found
+    snapshot_stats["n_taker_filled"] = n_taker_filled
+    snapshot_stats["n_maker_quotes_attempted"] = n_maker_quotes_attempted
+    snapshot_stats["n_maker_orders_posted"] = n_maker_orders_posted
+    snapshot_stats["n_maker_orders_filled"] = n_maker_orders_filled
+    snapshot_stats["taker_fill_rate"] = (
+        n_taker_filled / n_taker_edges_found if n_taker_edges_found else None
+    )
+    snapshot_stats["maker_fill_rate"] = (
+        n_maker_orders_filled / n_maker_orders_posted
+        if n_maker_orders_posted
+        else None
+    )
+
     notes_bt: list[str] = []
     if take_n > 1:
         notes_bt.append(
@@ -683,17 +745,39 @@ def replay_backtest(
 
 
 def _fill_to_dict(f: _Fill) -> dict[str, Any]:
+    """Serialise a fill with all post-time and settled fields the dashboards need.
+
+    ``realised_pnl_usd`` is the gross settlement payoff (does **not** subtract
+    ``fee_usd``); the dashboard subtracts ``fee_usd`` when it wants net PnL so
+    fees stay attributable to fills rather than being lumped into a global
+    bucket. ``expected_pnl_per_share_at_post`` already nets the relevant fee.
+    """
+    lead_days = max(0, (f.target_date - f.posted_at.date()).days)
     return {
         "event_slug": f.event_slug,
         "station_slug": f.station_slug,
         "bucket_label": f.bucket_label,
+        "bucket_lo_f": f.bucket_lo_f,
+        "bucket_hi_f": f.bucket_hi_f,
         "target_date": f.target_date.isoformat(),
+        "lead_days": lead_days,
         "side": f.side.value,
         "price": f.price,
         "shares": f.shares,
+        "notional_usd": round(f.price * f.shares, 6),
         "p_model_at_post": f.p_model_at_post,
+        "expected_pnl_per_share_at_post": f.expected_pnl_per_share_at_post,
+        "fee_usd": round(f.fee_usd, 6),
         "posted_at": f.posted_at.isoformat(),
         "filled_at": f.filled_at.isoformat(),
+        "realised_label": f.realised_label,
+        "realised_pnl_usd": round(f.realised_pnl_usd, 6),
+        "settled": f.realised_label is not None,
+        "won": (
+            None
+            if f.realised_label is None
+            else (f.realised_label == f.bucket_label)
+        ),
     }
 
 
@@ -712,6 +796,7 @@ def backtest_result_to_dict(
     net = result.pnl_taker_usd + result.pnl_maker_usd - result.fees_paid_usd
     return {
         "meta": {
+            "export_version": 2,
             "model_id": model_id,
             "start": start.isoformat(),
             "end": end.isoformat(),
