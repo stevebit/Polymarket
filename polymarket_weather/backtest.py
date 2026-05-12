@@ -224,6 +224,7 @@ def _fetch_resolutions(
           ON o.station_id = e.station_id
          AND o.obs_date   = e.target_date
          AND o.observed_max_f IS NOT NULL
+         AND o.finalized   = TRUE
          AND o.source IN ('wunderground:historical', 'noaa:ghcnd')
         WHERE e.event_slug = ANY(%s)
         """,

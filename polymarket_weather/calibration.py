@@ -99,6 +99,7 @@ def _fetch_resolved_buckets(
                           ON o.station_id   = e.station_id
                          AND o.obs_date     = e.target_date
                          AND o.observed_max_f IS NOT NULL
+                         AND o.finalized   = TRUE
         WHERE bp.model_id   = %s
           AND e.target_date <= CURRENT_DATE
           AND e.target_date >= %s
@@ -159,6 +160,7 @@ def _fetch_market_baseline_buckets(
                           ON o.station_id   = e.station_id
                          AND o.obs_date     = e.target_date
                          AND o.observed_max_f IS NOT NULL
+                         AND o.finalized   = TRUE
         WHERE e.target_date <= CURRENT_DATE
           AND e.target_date >= %s
           AND sn.slug = ANY(%s)
@@ -194,6 +196,7 @@ def _fetch_forecast_source_metrics(
           ON o.station_id = l.station_id
          AND o.obs_date   = l.target_date
          AND o.observed_max_f IS NOT NULL
+         AND o.finalized = TRUE
         JOIN stations s ON s.station_id = l.station_id
         WHERE s.slug = ANY(%s)
         GROUP BY s.slug, l.source
