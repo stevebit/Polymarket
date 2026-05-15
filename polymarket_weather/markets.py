@@ -251,6 +251,20 @@ VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
 ON CONFLICT (event_slug, bucket_label, snapshot_at) DO NOTHING
 """
 
+INSERT_TERMINAL_SNAPSHOT_SQL = """
+INSERT INTO pm_market_snapshots
+    (event_slug, bucket_label, snapshot_at, best_bid, best_ask,
+     last_trade, mid, depth_jsonb)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+ON CONFLICT (event_slug, bucket_label, snapshot_at) DO NOTHING
+RETURNING event_slug
+"""
+
+# Azure Postgres (and long TCP paths) may drop a session if one transaction
+# holds thousands of statements — chunk wide ``discover_history`` runs.
+_PERSIST_EVENTS_BATCH = 30
+_GAMMA_TERMINAL_BATCH = 25
+
 
 def persist_events(
     events: list[DiscoveredEvent], station_ids: dict[str, int]
@@ -260,36 +274,154 @@ def persist_events(
 
     n_ev = 0
     n_bk = 0
-    with with_conn() as conn, conn.cursor() as cur:
-        for ev in events:
-            sid = station_ids[ev.station.slug]
-            cur.execute(
-                UPSERT_EVENT_SQL,
-                (
-                    ev.slug,
-                    sid,
-                    ev.target_date,
-                    ev.gamma_event_id,
-                    json.dumps(ev.raw),
-                ),
-            )
-            n_ev += 1
-            for b in ev.buckets:
+    total = len(events)
+    n_chunks = (total + _PERSIST_EVENTS_BATCH - 1) // _PERSIST_EVENTS_BATCH if total else 0
+    for i in range(0, len(events), _PERSIST_EVENTS_BATCH):
+        chunk = events[i : i + _PERSIST_EVENTS_BATCH]
+        batch_num = i // _PERSIST_EVENTS_BATCH + 1
+        log.info(
+            "persist_events: committing batch %d/%d (%d events, %d total)",
+            batch_num,
+            n_chunks,
+            len(chunk),
+            total,
+        )
+        with with_conn() as conn, conn.cursor() as cur:
+            for ev in chunk:
+                sid = station_ids[ev.station.slug]
                 cur.execute(
-                    UPSERT_BUCKET_SQL,
+                    UPSERT_EVENT_SQL,
                     (
                         ev.slug,
-                        b["bucket_label"],
-                        b["lo_f"],
-                        b["hi_f"],
-                        b["yes_token_id"],
-                        b["no_token_id"],
-                        b["condition_id"],
-                        b["tick_size"],
+                        sid,
+                        ev.target_date,
+                        ev.gamma_event_id,
+                        json.dumps(ev.raw),
                     ),
                 )
-                n_bk += 1
+                n_ev += 1
+                for b in ev.buckets:
+                    cur.execute(
+                        UPSERT_BUCKET_SQL,
+                        (
+                            ev.slug,
+                            b["bucket_label"],
+                            b["lo_f"],
+                            b["hi_f"],
+                            b["yes_token_id"],
+                            b["no_token_id"],
+                            b["condition_id"],
+                            b["tick_size"],
+                        ),
+                    )
+                    n_bk += 1
     return {"pm_events": n_ev, "pm_buckets": n_bk}
+
+
+def _parse_gamma_timestamp(raw: str | None) -> dt.datetime | None:
+    """Parse Gamma ``closedTime`` strings like ``2026-05-10 19:10:19+00``."""
+    if not raw or not str(raw).strip():
+        return None
+    s = str(raw).strip().replace(" ", "T", 1)
+    if s.endswith("+00"):
+        s = s[:-3] + "+00:00"
+    try:
+        t = dt.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)
+    return t.astimezone(dt.timezone.utc)
+
+
+def persist_gamma_terminal_snapshots(events: list[DiscoveredEvent]) -> int:
+    """Insert one ``pm_market_snapshots`` row per **closed** bucket from Gamma.
+
+    For resolved daily-high markets, Gamma exposes terminal ``outcomePrices``
+    (YES token probability) and ``closedTime``. This is **not** a high-frequency
+    CLOB history, but it gives a credible end-state book for every bucket on the
+    same timestamp so calibration / ``market:mid`` scoring works over long
+    windows without retroactive CLOB archives.
+
+    Rows use ``depth_jsonb`` marker ``source: gamma_terminal`` so downstream
+    code can distinguish synthetic closes from live ``ClobClient`` snapshots.
+    Conflicts on ``(event_slug, bucket_label, snapshot_at)`` are ignored.
+
+    Writes are committed in batches so a long ``discover_history`` window does
+    not hold a single transaction open for tens of thousands of INSERTs (which
+    can trigger Azure / gateway disconnects).
+    """
+    from .db import with_conn
+
+    inserted = 0
+    total_ev = len(events)
+    n_batches = (total_ev + _GAMMA_TERMINAL_BATCH - 1) // _GAMMA_TERMINAL_BATCH if total_ev else 0
+    for i in range(0, len(events), _GAMMA_TERMINAL_BATCH):
+        chunk = events[i : i + _GAMMA_TERMINAL_BATCH]
+        batch_num = i // _GAMMA_TERMINAL_BATCH + 1
+        log.info(
+            "gamma_terminal_snapshots: batch %d/%d (%d events, %d total)",
+            batch_num,
+            n_batches,
+            len(chunk),
+            total_ev,
+        )
+        with with_conn() as conn, conn.cursor() as cur:
+            for ev in chunk:
+                for m in ev.raw.get("markets") or []:
+                    if not m.get("closed"):
+                        continue
+                    label = m.get("groupItemTitle") or ""
+                    if parse_bucket_label(label) is None:
+                        continue
+                    ts = _parse_gamma_timestamp(m.get("closedTime")) or _parse_gamma_timestamp(
+                        ev.raw.get("closedTime")
+                    )
+                    if ts is None:
+                        continue
+                    raw_prices = m.get("outcomePrices")
+                    prices = _coerce_json_field(raw_prices)
+                    if not isinstance(prices, list) or len(prices) < 1:
+                        continue
+                    try:
+                        yes_p = float(prices[0])
+                    except (TypeError, ValueError):
+                        continue
+                    yes_p = max(0.0, min(1.0, yes_p))
+                    bb = m.get("bestBid")
+                    ba = m.get("bestAsk")
+                    try:
+                        bb_f = float(bb) if bb is not None else None
+                        ba_f = float(ba) if ba is not None else None
+                    except (TypeError, ValueError):
+                        bb_f, ba_f = None, None
+                    if bb_f is None or ba_f is None:
+                        tick = 0.005
+                        bb_f = max(0.0, yes_p - tick)
+                        ba_f = min(1.0, yes_p + tick)
+                    mid = (bb_f + ba_f) / 2.0 if bb_f is not None and ba_f is not None else yes_p
+                    depth = {
+                        "source": "gamma_terminal",
+                        "outcomePrices": prices,
+                        "lastTradePrice": m.get("lastTradePrice"),
+                        "groupItemTitle": label,
+                    }
+                    cur.execute(
+                        INSERT_TERMINAL_SNAPSHOT_SQL,
+                        (
+                            ev.slug,
+                            label,
+                            ts,
+                            bb_f,
+                            ba_f,
+                            None,
+                            mid,
+                            json.dumps(depth),
+                        ),
+                    )
+                    if cur.fetchone():
+                        inserted += 1
+    return inserted
 
 
 # ---------------------------------------------------------------------------

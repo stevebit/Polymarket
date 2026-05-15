@@ -31,14 +31,30 @@ def _get_pool() -> ConnectionPool:
     global _POOL
     with _POOL_LOCK:
         if _POOL is None:
-            _POOL = ConnectionPool(
+            # Assign only after wait() succeeds. If wait times out it closes
+            # the pool internally; leaving _POOL=None allows a clean retry.
+            pool = ConnectionPool(
                 conninfo=config.postgres_url(),
                 min_size=1,
                 max_size=4,
-                timeout=30,
-                kwargs={"connect_timeout": 15},
+                timeout=120.0,
+                kwargs={
+                    "connect_timeout": 60,
+                    "keepalives": 1,
+                    "keepalives_idle": 30,
+                    "keepalives_interval": 10,
+                    "keepalives_count": 3,
+                },
             )
-            _POOL.wait()
+            try:
+                pool.wait(timeout=120.0)
+            except BaseException:
+                try:
+                    pool.close()
+                except Exception:
+                    pass
+                raise
+            _POOL = pool
         return _POOL
 
 

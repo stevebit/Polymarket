@@ -91,15 +91,39 @@ def project_to_simplex(p: np.ndarray) -> np.ndarray:
     return np.maximum(p + lam, 0.0)
 
 
+PROB_FLOOR = 1e-4
+"""Minimum bucket probability after projection (review §2.11).
+
+Without a floor, the simplex projection can clip very small tail
+probabilities (e.g. ``0.0001``) to exactly 0, which then forces log-loss
+to ``+inf`` if the tail actually resolves and makes the "buy a cheap
+tail" arbitrage path unreachable. ``1e-4`` is small enough not to bias
+the score on resolved events but large enough that the tails never
+collapse."""
+
+
 def coherent_model_probs(
     raw_probs: dict[str, float],
+    *,
+    prob_floor: float = PROB_FLOOR,
 ) -> dict[str, float]:
     """Take raw model bucket probs (which sum approximately to 1 already
     since :func:`predict_bucket_probs` renormalises), and project them onto
-    the simplex to ensure exact sum = 1. Defensive against numerical drift."""
+    the simplex to ensure exact sum = 1. Defensive against numerical drift.
+
+    A tail floor of ``prob_floor`` is applied **before and after** the
+    projection so very small probabilities don't collapse to exactly 0
+    (review §2.11)."""
     if not raw_probs:
         return raw_probs
     labels = list(raw_probs.keys())
     arr = np.array([raw_probs[k] for k in labels], dtype=float)
+    # Pre-floor so the projection doesn't immediately clip tiny entries.
+    arr = np.maximum(arr, prob_floor)
     proj = project_to_simplex(arr)
+    # Re-floor and re-normalise: the projection may still push entries to 0.
+    proj = np.maximum(proj, prob_floor)
+    s = float(proj.sum())
+    if s > 0:
+        proj = proj / s
     return {k: float(v) for k, v in zip(labels, proj)}

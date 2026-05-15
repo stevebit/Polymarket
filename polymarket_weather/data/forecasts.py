@@ -72,6 +72,31 @@ class ForecastRow:
     raw: dict
 
 
+# Hourly-cadence sources (HRRR / RAP / NBM-hourly) round to the previous
+# hour. Global deterministic models cycle at 00/06/12/18 UTC.
+# ``gfs_hrrr`` is the Historical Forecast API name for the CONUS HRRR nest;
+# the live ``/v1/gfs`` client still exposes it as ``hrrr_conus``.
+HOURLY_CADENCE_MODELS = {"hrrr_conus", "gfs_hrrr", "rap_conus", "rap"}
+
+
+def model_cycle_at(now_utc: dt.datetime, model: str) -> dt.datetime:
+    """Round ``now_utc`` down to the most recent model cycle.
+
+    Global deterministic / ensemble models (GFS, ECMWF IFS, ICON, GEM,
+    AIFS, GraphCast, NBM probabilistic) cycle every 6 hours at 00 / 06 /
+    12 / 18 UTC. HRRR and RAP cycle hourly. This helper replaces the old
+    ``current_weather.time`` heuristic which was an observation timestamp
+    masquerading as a model cycle — see review §2.8.
+    """
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=dt.timezone.utc)
+    if model in HOURLY_CADENCE_MODELS:
+        return now_utc.replace(minute=0, second=0, microsecond=0)
+    # 6-hourly: round down to the most recent multiple of 6 hours.
+    cycle_hour = (now_utc.hour // 6) * 6
+    return now_utc.replace(hour=cycle_hour, minute=0, second=0, microsecond=0)
+
+
 # ---------------------------------------------------------------------------
 # Retry helper
 # ---------------------------------------------------------------------------
@@ -139,20 +164,16 @@ async def _fetch_openmeteo(
     daily = j.get("daily") or {}
     dates = daily.get("time") or []
     # Per-model arrays come back as ``temperature_2m_max_<model>``.
-    run_time = dt.datetime.now(dt.timezone.utc)
-    cw = j.get("current_weather") or {}
-    if isinstance(cw, dict) and cw.get("time"):
-        try:
-            run_time = dt.datetime.fromisoformat(cw["time"]).replace(
-                tzinfo=ZoneInfo(station.tz)
-            ).astimezone(dt.timezone.utc)
-        except Exception:
-            pass
+    # Each model has its own cycle; use ``model_cycle_at`` (review §2.8)
+    # to assign a *real* cycle timestamp rather than ``current_weather.time``
+    # which is an observation, not a forecast issue time.
+    now_utc = dt.datetime.now(dt.timezone.utc)
 
     rows: list[ForecastRow] = []
     for model in OPEN_METEO_MODELS:
         key = f"temperature_2m_max_{model}"
         values = daily.get(key) or []
+        run_time = model_cycle_at(now_utc, model)
         for ds, v in zip(dates, values):
             try:
                 tdate = dt.date.fromisoformat(ds)
@@ -172,6 +193,270 @@ async def _fetch_openmeteo(
                 )
             )
     return rows
+
+
+async def _fetch_openmeteo_generic(
+    client: httpx.AsyncClient,
+    station: Station,
+    *,
+    endpoint: str,
+    model_id: str,
+    source_name: str,
+    past_days: int,
+    forecast_days: int,
+    hourly: bool = False,
+) -> list[ForecastRow]:
+    """Generic Open-Meteo fetcher for one model id.
+
+    Phase 3 (review §4.1 / §4.3) adds HRRR, ECMWF AIFS, and GFS GraphCast
+    through this single shape:
+
+    * ``endpoint``: Open-Meteo URL (``/v1/forecast`` or ``/v1/gfs``).
+    * ``model_id``: the value passed to ``?models=``.
+    * ``hourly=True`` fetches ``hourly=temperature_2m`` and aggregates to
+      per-local-day max (HRRR / GraphCast). ``hourly=False`` requests
+      ``daily=temperature_2m_max`` directly (AIFS).
+    * ``source_name`` is the value persisted to ``forecasts.source``.
+
+    Network failures are surfaced; orchestration code wraps every call in
+    a try/except so one flaky source doesn't break the tick.
+    """
+    common = {
+        "latitude": station.lat,
+        "longitude": station.lon,
+        "temperature_unit": "fahrenheit",
+        "timezone": station.tz,
+        "models": model_id,
+        "past_days": past_days,
+        "forecast_days": forecast_days,
+    }
+    if hourly:
+        params = dict(common, hourly="temperature_2m")
+    else:
+        params = dict(common, daily="temperature_2m_max")
+
+    r = await _get_with_retry(client, endpoint, params=params)
+    j = r.json()
+
+    run_time = model_cycle_at(dt.datetime.now(dt.timezone.utc), model_id)
+    rows: list[ForecastRow] = []
+
+    if not hourly:
+        daily = j.get("daily") or {}
+        dates = daily.get("time") or []
+        values = daily.get("temperature_2m_max") or []
+        for ds, v in zip(dates, values):
+            if v is None:
+                continue
+            try:
+                tdate = dt.date.fromisoformat(ds)
+            except ValueError:
+                continue
+            rows.append(
+                ForecastRow(
+                    station_id=0,
+                    target_date=tdate,
+                    source=source_name,
+                    run_time=run_time,
+                    predicted_max_f=float(v),
+                    predicted_std_f=None,
+                    raw={"model": model_id, "value": v, "unit": "F"},
+                )
+            )
+        return rows
+
+    # Hourly path: aggregate to local-tz day max.
+    hourly_block = j.get("hourly") or {}
+    times = hourly_block.get("time") or []
+    temps = hourly_block.get("temperature_2m") or []
+    tz = ZoneInfo(station.tz)
+    bucket: dict[dt.date, list[float]] = {}
+    for ts_str, v in zip(times, temps):
+        if v is None:
+            continue
+        try:
+            ts = dt.datetime.fromisoformat(ts_str)
+        except ValueError:
+            continue
+        # Open-Meteo returns naive local times when ``timezone=`` is set.
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=tz)
+        local = ts.astimezone(tz)
+        bucket.setdefault(local.date(), []).append(float(v))
+
+    for d, vals in sorted(bucket.items()):
+        if not vals:
+            continue
+        rows.append(
+            ForecastRow(
+                station_id=0,
+                target_date=d,
+                source=source_name,
+                run_time=run_time,
+                predicted_max_f=max(vals),
+                predicted_std_f=None,
+                raw={"model": model_id, "n_hours": len(vals), "max": max(vals)},
+            )
+        )
+    return rows
+
+
+NBM_PERCENTILES = (10, 25, 50, 75, 90)
+
+
+async def _fetch_nbm_percentiles(
+    client: httpx.AsyncClient,
+    station: Station,
+    *,
+    past_days: int,
+    forecast_days: int,
+) -> list[ForecastRow]:
+    """NBM probabilistic percentiles (P10 / P25 / P50 / P75 / P90).
+
+    Review §4.2: NBM publishes probabilistic temperature percentiles
+    alongside its deterministic best-blend. Aggregating per-day max for
+    each percentile gives us a 5-knot empirical CDF directly — feeding
+    :class:`PercentileCDF` from ``score.py`` skips the
+    Gaussian-approximation step entirely for the bucket integration.
+
+    Open-Meteo's GFS endpoint exposes these as
+    ``temperature_2m_percentile_10`` through ``..._90`` when ``models=
+    gfs_nbm``. The endpoint isn't fully documented for every percentile
+    so we degrade silently if a field is missing: any percentile with no
+    data is just left empty and downstream code falls back to the
+    deterministic NBM source.
+    """
+    pct_fields = [f"temperature_2m_percentile_{p}" for p in NBM_PERCENTILES]
+    params = {
+        "latitude": station.lat,
+        "longitude": station.lon,
+        "hourly": ",".join(["temperature_2m", *pct_fields]),
+        "temperature_unit": "fahrenheit",
+        "timezone": station.tz,
+        "models": "gfs_nbm",
+        "past_days": past_days,
+        "forecast_days": forecast_days,
+    }
+    try:
+        r = await _get_with_retry(
+            client, "https://api.open-meteo.com/v1/gfs", params=params,
+        )
+        j = r.json()
+    except Exception as exc:  # noqa: BLE001
+        log.info("NBM percentiles unavailable for %s: %s", station.slug, exc)
+        return []
+
+    hourly_block = j.get("hourly") or {}
+    times = hourly_block.get("time") or []
+    if not times:
+        return []
+    tz = ZoneInfo(station.tz)
+    run_time = model_cycle_at(dt.datetime.now(dt.timezone.utc), "gfs_nbm")
+    rows: list[ForecastRow] = []
+
+    for p in NBM_PERCENTILES:
+        key = f"temperature_2m_percentile_{p}"
+        vals = hourly_block.get(key) or []
+        if not vals:
+            continue
+        bucket: dict[dt.date, list[float]] = {}
+        for ts_str, v in zip(times, vals):
+            if v is None:
+                continue
+            try:
+                ts = dt.datetime.fromisoformat(ts_str)
+            except ValueError:
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=tz)
+            local = ts.astimezone(tz)
+            bucket.setdefault(local.date(), []).append(float(v))
+        for d, day_vals in sorted(bucket.items()):
+            if not day_vals:
+                continue
+            rows.append(
+                ForecastRow(
+                    station_id=0,
+                    target_date=d,
+                    source=f"nbm:p{p:02d}",
+                    run_time=run_time,
+                    predicted_max_f=max(day_vals),
+                    predicted_std_f=None,
+                    raw={"percentile": p, "n_hours": len(day_vals)},
+                )
+            )
+
+    return rows
+
+
+async def _fetch_hrrr_conus(
+    client: httpx.AsyncClient,
+    station: Station,
+    *,
+    past_days: int,
+    forecast_days: int,
+) -> list[ForecastRow]:
+    """HRRR (CONUS-only, ~3 km, hourly cycle, 18-48h horizon).
+
+    Review §4.1: HRRR is the single highest-leverage add — it dominates the
+    next 0-2 days vs the 25-km global models for the temperature_2m field.
+    CONUS-only, gracefully empty for stations outside CONUS.
+    """
+    return await _fetch_openmeteo_generic(
+        client, station,
+        endpoint="https://api.open-meteo.com/v1/gfs",
+        model_id="hrrr_conus",
+        source_name="openmeteo:hrrr_conus",
+        past_days=past_days,
+        forecast_days=min(forecast_days, 2),  # HRRR horizon is short
+        hourly=True,
+    )
+
+
+async def _fetch_ecmwf_aifs(
+    client: httpx.AsyncClient,
+    station: Station,
+    *,
+    past_days: int,
+    forecast_days: int,
+) -> list[ForecastRow]:
+    """ECMWF AIFS (Artificial Intelligence Forecasting System).
+
+    Review §4.3: an ECMWF-trained ML model that scores comparably with the
+    operational IFS and is operationally maintained by ECMWF.
+    """
+    return await _fetch_openmeteo_generic(
+        client, station,
+        endpoint=OPEN_METEO_URL,
+        model_id="ecmwf_aifs025_single",
+        source_name="openmeteo:aifs025_single",
+        past_days=past_days,
+        forecast_days=forecast_days,
+        hourly=False,
+    )
+
+
+async def _fetch_gfs_graphcast(
+    client: httpx.AsyncClient,
+    station: Station,
+    *,
+    past_days: int,
+    forecast_days: int,
+) -> list[ForecastRow]:
+    """GFS GraphCast (Google DeepMind ML, 6-hourly, run on GFS init).
+
+    Review §4.3: independent ML model, weakly correlated with AIFS errors,
+    so adding both expands the effective ensemble.
+    """
+    return await _fetch_openmeteo_generic(
+        client, station,
+        endpoint=OPEN_METEO_URL,
+        model_id="gfs_graphcast025",
+        source_name="openmeteo:gfs_graphcast025",
+        past_days=past_days,
+        forecast_days=forecast_days,
+        hourly=True,
+    )
 
 
 async def _fetch_openmeteo_bestmatch(
@@ -196,17 +481,9 @@ async def _fetch_openmeteo_bestmatch(
     daily = j.get("daily") or {}
     dates = daily.get("time") or []
     values = daily.get("temperature_2m_max") or []
-    run_time = dt.datetime.now(dt.timezone.utc)
-    cw = j.get("current_weather") or {}
-    if isinstance(cw, dict) and cw.get("time"):
-        try:
-            run_time = (
-                dt.datetime.fromisoformat(cw["time"])
-                .replace(tzinfo=ZoneInfo(station.tz))
-                .astimezone(dt.timezone.utc)
-            )
-        except Exception:
-            pass
+    # Bestmatch is Open-Meteo's blended product (NBM-like cadence). Use a
+    # 6-hourly cycle anchor — see review §2.8.
+    run_time = model_cycle_at(dt.datetime.now(dt.timezone.utc), "bestmatch")
 
     rows: list[ForecastRow] = []
     for ds, v in zip(dates, values):
@@ -681,6 +958,49 @@ async def ingest_forecasts_async(
                 collected.extend(bm)
             except Exception as exc:  # noqa: BLE001
                 log.warning("Open-Meteo bestmatch failed for %s: %s", s.slug, exc)
+            # HRRR (review §4.1) — CONUS only; harmless to call for all
+            # current stations (they're all US).
+            try:
+                hrrr = await _fetch_hrrr_conus(
+                    client, s, past_days=past_days, forecast_days=forecast_days
+                )
+                for row in hrrr:
+                    row.station_id = sid
+                collected.extend(hrrr)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Open-Meteo HRRR failed for %s: %s", s.slug, exc)
+            # ECMWF AIFS (review §4.3).
+            try:
+                aifs = await _fetch_ecmwf_aifs(
+                    client, s, past_days=past_days, forecast_days=forecast_days
+                )
+                for row in aifs:
+                    row.station_id = sid
+                collected.extend(aifs)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Open-Meteo AIFS failed for %s: %s", s.slug, exc)
+            # GFS GraphCast (review §4.3).
+            try:
+                gc = await _fetch_gfs_graphcast(
+                    client, s, past_days=past_days, forecast_days=forecast_days
+                )
+                for row in gc:
+                    row.station_id = sid
+                collected.extend(gc)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "Open-Meteo GraphCast failed for %s: %s", s.slug, exc
+                )
+            # NBM probabilistic percentiles (review §4.2).
+            try:
+                pct = await _fetch_nbm_percentiles(
+                    client, s, past_days=past_days, forecast_days=forecast_days
+                )
+                for row in pct:
+                    row.station_id = sid
+                collected.extend(pct)
+            except Exception as exc:  # noqa: BLE001
+                log.info("NBM percentiles failed for %s: %s", s.slug, exc)
             try:
                 nws = await _fetch_nws(
                     client, s, headers=headers, forecast_days=forecast_days

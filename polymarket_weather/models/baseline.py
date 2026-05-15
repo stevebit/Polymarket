@@ -25,6 +25,7 @@ from typing import Iterable
 
 from ..db import station_id_by_slug, with_conn
 from ..score import BucketBounds, event_probabilities
+from ..strategy.source_whitelist import source_allowed
 
 log = logging.getLogger(__name__)
 
@@ -43,20 +44,41 @@ def _latest_forecasts_for(
     cur,
     station_id: int,
     target_date: dt.date,
+    *,
+    as_of: dt.datetime | None = None,
 ) -> list[tuple[str, float, dt.datetime]]:
     """Return ``(source, predicted_max_f, run_time)`` for the most recent
-    run_time per source for the given (station, target_date)."""
-    cur.execute(
-        """
-        SELECT DISTINCT ON (source) source, predicted_max_f, run_time
-        FROM forecasts
-        WHERE station_id = %s
-          AND target_date = %s
-          AND predicted_max_f IS NOT NULL
-        ORDER BY source, run_time DESC
-        """,
-        (station_id, target_date),
-    )
+    run_time per source for the given (station, target_date).
+
+    If ``as_of`` is set, only forecast cycles with ``run_time <= as_of`` are
+    considered. Used by the ``predict --as-of`` historical-replay mode to
+    guarantee no leakage from future cycles.
+    """
+    if as_of is None:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (source) source, predicted_max_f, run_time
+            FROM forecasts
+            WHERE station_id = %s
+              AND target_date = %s
+              AND predicted_max_f IS NOT NULL
+            ORDER BY source, run_time DESC
+            """,
+            (station_id, target_date),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (source) source, predicted_max_f, run_time
+            FROM forecasts
+            WHERE station_id = %s
+              AND target_date = %s
+              AND predicted_max_f IS NOT NULL
+              AND run_time   <= %s
+            ORDER BY source, run_time DESC
+            """,
+            (station_id, target_date, as_of),
+        )
     return list(cur.fetchall())
 
 
@@ -67,37 +89,75 @@ def _source_mae(
     *,
     lookback_days: int,
     end_date: dt.date,
+    as_of: dt.datetime | None = None,
 ) -> tuple[float | None, int]:
-    """Most recent run per (target_date) for that source vs observed."""
-    cur.execute(
-        """
-        WITH latest AS (
-            SELECT DISTINCT ON (target_date)
-                target_date,
-                predicted_max_f
-            FROM forecasts
-            WHERE station_id = %s
-              AND source     = %s
-              AND target_date BETWEEN %s AND %s
-              AND predicted_max_f IS NOT NULL
-            ORDER BY target_date, run_time DESC
+    """Most recent run per (target_date) for that source vs observed.
+
+    If ``as_of`` is set, only forecast cycles with ``run_time <= as_of`` are
+    considered (no leakage from later cycles). ``end_date`` already bounds
+    ``target_date``; the as_of clause is the temporal cutoff on the forecast
+    *issue time*.
+    """
+    if as_of is None:
+        cur.execute(
+            """
+            WITH latest AS (
+                SELECT DISTINCT ON (target_date)
+                    target_date,
+                    predicted_max_f
+                FROM forecasts
+                WHERE station_id = %s
+                  AND source     = %s
+                  AND target_date BETWEEN %s AND %s
+                  AND predicted_max_f IS NOT NULL
+                ORDER BY target_date, run_time DESC
+            )
+            SELECT AVG(ABS(l.predicted_max_f - o.observed_max_f))::float8 AS mae,
+                   COUNT(*)                                                AS n
+            FROM latest l
+            JOIN observations o
+              ON o.station_id = %s
+             AND o.obs_date   = l.target_date
+             AND o.observed_max_f IS NOT NULL
+            """,
+            (
+                station_id, source,
+                end_date - dt.timedelta(days=lookback_days), end_date,
+                station_id,
+            ),
         )
-        SELECT AVG(ABS(l.predicted_max_f - o.observed_max_f))::float8 AS mae,
-               COUNT(*)                                                AS n
-        FROM latest l
-        JOIN observations o
-          ON o.station_id = %s
-         AND o.obs_date   = l.target_date
-         AND o.observed_max_f IS NOT NULL
-        """,
-        (
-            station_id,
-            source,
-            end_date - dt.timedelta(days=lookback_days),
-            end_date,
-            station_id,
-        ),
-    )
+    else:
+        cur.execute(
+            """
+            WITH latest AS (
+                SELECT DISTINCT ON (target_date)
+                    target_date,
+                    predicted_max_f
+                FROM forecasts
+                WHERE station_id = %s
+                  AND source     = %s
+                  AND target_date BETWEEN %s AND %s
+                  AND predicted_max_f IS NOT NULL
+                  AND run_time    <= %s
+                ORDER BY target_date, run_time DESC
+            )
+            SELECT AVG(ABS(l.predicted_max_f - o.observed_max_f))::float8 AS mae,
+                   COUNT(*)                                                AS n
+            FROM latest l
+            JOIN observations o
+              ON o.station_id = %s
+             AND o.obs_date   = l.target_date
+             AND o.observed_max_f IS NOT NULL
+             AND o.ingested_at <= %s
+            """,
+            (
+                station_id, source,
+                end_date - dt.timedelta(days=lookback_days), end_date,
+                as_of,
+                station_id,
+                as_of,
+            ),
+        )
     row = cur.fetchone()
     if not row or row[0] is None:
         return None, 0
@@ -105,40 +165,84 @@ def _source_mae(
 
 
 def _station_residual_std(
-    cur, station_id: int, *, end_date: dt.date, lookback_days: int = 90
+    cur,
+    station_id: int,
+    *,
+    end_date: dt.date,
+    lookback_days: int = 90,
+    as_of: dt.datetime | None = None,
 ) -> float | None:
     """Station-level residual sigma using the per-target_date forecast mean
-    across all sources vs observed."""
-    cur.execute(
-        """
-        WITH latest AS (
-            SELECT DISTINCT ON (source, target_date)
-                source, target_date, predicted_max_f
-            FROM forecasts
-            WHERE station_id = %s
-              AND target_date BETWEEN %s AND %s
-              AND predicted_max_f IS NOT NULL
-            ORDER BY source, target_date, run_time DESC
-        ),
-        per_day AS (
-            SELECT target_date, AVG(predicted_max_f)::float8 AS mean_f
-            FROM latest
-            GROUP BY target_date
+    across all sources vs observed.
+
+    If ``as_of`` is given, forecast cycles are filtered to ``run_time <=
+    as_of`` and observations to ``ingested_at <= as_of`` (no leakage)."""
+    if as_of is None:
+        cur.execute(
+            """
+            WITH latest AS (
+                SELECT DISTINCT ON (source, target_date)
+                    source, target_date, predicted_max_f
+                FROM forecasts
+                WHERE station_id = %s
+                  AND target_date BETWEEN %s AND %s
+                  AND predicted_max_f IS NOT NULL
+                ORDER BY source, target_date, run_time DESC
+            ),
+            per_day AS (
+                SELECT target_date, AVG(predicted_max_f)::float8 AS mean_f
+                FROM latest
+                GROUP BY target_date
+            )
+            SELECT STDDEV_SAMP(p.mean_f - o.observed_max_f)::float8
+            FROM per_day p
+            JOIN observations o
+              ON o.station_id = %s
+             AND o.obs_date   = p.target_date
+             AND o.observed_max_f IS NOT NULL
+            """,
+            (
+                station_id,
+                end_date - dt.timedelta(days=lookback_days),
+                end_date,
+                station_id,
+            ),
         )
-        SELECT STDDEV_SAMP(p.mean_f - o.observed_max_f)::float8
-        FROM per_day p
-        JOIN observations o
-          ON o.station_id = %s
-         AND o.obs_date   = p.target_date
-         AND o.observed_max_f IS NOT NULL
-        """,
-        (
-            station_id,
-            end_date - dt.timedelta(days=lookback_days),
-            end_date,
-            station_id,
-        ),
-    )
+    else:
+        cur.execute(
+            """
+            WITH latest AS (
+                SELECT DISTINCT ON (source, target_date)
+                    source, target_date, predicted_max_f
+                FROM forecasts
+                WHERE station_id = %s
+                  AND target_date BETWEEN %s AND %s
+                  AND predicted_max_f IS NOT NULL
+                  AND run_time    <= %s
+                ORDER BY source, target_date, run_time DESC
+            ),
+            per_day AS (
+                SELECT target_date, AVG(predicted_max_f)::float8 AS mean_f
+                FROM latest
+                GROUP BY target_date
+            )
+            SELECT STDDEV_SAMP(p.mean_f - o.observed_max_f)::float8
+            FROM per_day p
+            JOIN observations o
+              ON o.station_id = %s
+             AND o.obs_date   = p.target_date
+             AND o.observed_max_f IS NOT NULL
+             AND o.ingested_at <= %s
+            """,
+            (
+                station_id,
+                end_date - dt.timedelta(days=lookback_days),
+                end_date,
+                as_of,
+                station_id,
+                as_of,
+            ),
+        )
     row = cur.fetchone()
     if not row or row[0] is None:
         return None
@@ -249,8 +353,14 @@ def predict_m0_for(
     *,
     run_time: dt.datetime,
     mae_lookback_days: int = 30,
+    as_of: dt.datetime | None = None,
+    station_slug: str | None = None,
 ) -> Prediction | None:
-    forecasts = _latest_forecasts_for(cur, station_id, target_date)
+    forecasts = _latest_forecasts_for(cur, station_id, target_date, as_of=as_of)
+    if station_slug is not None:
+        forecasts = [
+            row for row in forecasts if source_allowed(station_slug, row[0])
+        ]
     if not forecasts:
         return None
 
@@ -261,6 +371,7 @@ def predict_m0_for(
         mae, n = _source_mae(
             cur, station_id, source,
             lookback_days=mae_lookback_days, end_date=mae_ref_date,
+            as_of=as_of,
         )
         source_maes[source] = {"mae": mae, "n": n, "predicted": float(predicted)}
         if mae is None or n < 3:
@@ -317,8 +428,14 @@ def predict_m1_for(
     run_time: dt.datetime,
     mae_lookback_days: int = 30,
     residual_lookback_days: int = 90,
+    as_of: dt.datetime | None = None,
+    station_slug: str | None = None,
 ) -> Prediction | None:
-    forecasts = _latest_forecasts_for(cur, station_id, target_date)
+    forecasts = _latest_forecasts_for(cur, station_id, target_date, as_of=as_of)
+    if station_slug is not None:
+        forecasts = [
+            row for row in forecasts if source_allowed(station_slug, row[0])
+        ]
     if not forecasts:
         return None
 
@@ -329,6 +446,7 @@ def predict_m1_for(
         mae, n = _source_mae(
             cur, station_id, source,
             lookback_days=mae_lookback_days, end_date=mae_ref_date,
+            as_of=as_of,
         )
         source_maes[source] = {"mae": mae, "n": n, "predicted": float(predicted)}
         if mae is None or n < 3 or mae <= 0:
@@ -348,7 +466,10 @@ def predict_m1_for(
         else 0.0
     )
     residual_sigma = _station_residual_std(
-        cur, station_id, end_date=mae_ref_date, lookback_days=residual_lookback_days
+        cur, station_id,
+        end_date=mae_ref_date,
+        lookback_days=residual_lookback_days,
+        as_of=as_of,
     )
     residual_var = (
         residual_sigma ** 2
@@ -356,7 +477,13 @@ def predict_m1_for(
         else DEFAULT_FALLBACK_SIGMA ** 2
     )
     sigma = math.sqrt(within_var + residual_var)
-    sigma = max(sigma, 0.75)
+    # Sigma floor (review §2.7): the old 0.75°F floor was tighter than the
+    # observed station-level residual MAE for almost every city, which led
+    # to over-confident bucket probabilities at the tails. Floor at
+    # ``max(2.0, residual_sigma)`` so the predictive never claims to know
+    # more than the actual recent residual variance.
+    sigma_floor = max(2.0, residual_sigma if residual_sigma is not None else 0.0)
+    sigma = max(sigma, sigma_floor)
 
     return Prediction(
         model_id=MODEL_M1,
@@ -384,11 +511,21 @@ def run_predictions(
     target_dates: Iterable[dt.date],
     *,
     models: tuple[str, ...] = (MODEL_M0, MODEL_M1),
+    as_of: dt.datetime | None = None,
 ) -> dict[str, int]:
+    """Run M0/M1 for each (station, target_date).
+
+    If ``as_of`` is set:
+      - the persisted ``run_time`` becomes ``as_of`` (so calibration /
+        backtest SQL see the same temporal anchor that bounded the data);
+      - every internal SELECT is filtered to ``run_time <= as_of`` and
+        ``ingested_at <= as_of`` to guarantee no leakage from data that
+        wasn't available at that wall-clock.
+    """
     sid_map = station_id_by_slug()
     n_pred = 0
     n_probs = 0
-    run_time = dt.datetime.now(dt.timezone.utc)
+    run_time = as_of if as_of is not None else dt.datetime.now(dt.timezone.utc)
     target_dates = list(target_dates)
     with with_conn() as conn, conn.cursor() as cur:
         for slug in station_slugs:
@@ -400,9 +537,15 @@ def run_predictions(
                 preds: list[Prediction] = []
                 for model_id in models:
                     if model_id == MODEL_M0:
-                        p = predict_m0_for(cur, sid, target, run_time=run_time)
+                        p = predict_m0_for(
+                            cur, sid, target, run_time=run_time, as_of=as_of,
+                            station_slug=slug,
+                        )
                     elif model_id == MODEL_M1:
-                        p = predict_m1_for(cur, sid, target, run_time=run_time)
+                        p = predict_m1_for(
+                            cur, sid, target, run_time=run_time, as_of=as_of,
+                            station_slug=slug,
+                        )
                     else:
                         log.warning("Unknown model_id %r — skipping", model_id)
                         continue

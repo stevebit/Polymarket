@@ -13,7 +13,12 @@ import datetime as dt
 
 from ..data.hourly_observations import ingest_hourly_observations
 from ..db import init_schema_and_seed
-from ._common import add_common_args, configure_logging, parse_stations
+from ._common import (
+    add_common_args,
+    configure_logging,
+    parse_cli_date,
+    parse_stations,
+)
 
 
 def main() -> None:
@@ -21,15 +26,15 @@ def main() -> None:
     add_common_args(p, with_date=False)
     p.add_argument(
         "--start",
-        type=lambda s: dt.date.fromisoformat(s),
+        type=parse_cli_date,
         required=True,
-        help="First calendar day (UTC window on Mesonet) to fetch.",
+        help="First calendar day: YYYY-MM-DD or today/yesterday (UTC).",
     )
     p.add_argument(
         "--end",
-        type=lambda s: dt.date.fromisoformat(s),
-        default=dt.date.today(),
-        help="Last calendar day (inclusive).",
+        type=parse_cli_date,
+        default=dt.datetime.now(dt.timezone.utc).date(),
+        help="Last calendar day (inclusive). Default today UTC.",
     )
     p.add_argument(
         "--chunk-days",

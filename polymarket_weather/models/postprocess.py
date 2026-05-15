@@ -254,25 +254,30 @@ def _fetch_training_pairs(
         dtype=float,
     )
 
-    # Match observations once (we already filtered by IS NOT NULL); fetch the
-    # finalised observation per target. Prefer wunderground:historical (since
-    # that's the resolution source), else noaa:ghcnd.
+    # Match observations once. Polymarket weather markets resolve against
+    # wunderground.com (review §3.3), so we *only* train EMOS against
+    # ``wunderground:historical`` rows. Training on NOAA GHCND would push
+    # the fit toward a measurement source that disagrees with the
+    # resolution source by ~0.3°F on average — silently biasing the bucket
+    # probabilities for events that resolve near a boundary.
     cur.execute(
         """
-        SELECT obs_date, source, observed_max_f
+        SELECT obs_date, observed_max_f
         FROM observations
         WHERE station_id = %s
           AND obs_date = ANY(%s)
           AND observed_max_f IS NOT NULL
-          AND source IN ('wunderground:historical', 'noaa:ghcnd')
+          AND source = 'wunderground:historical'
         """,
         (station_id, target_dates),
     )
-    by_date: dict[dt.date, float] = {}
-    for d, src, val in cur.fetchall():
-        if d in by_date and src != "wunderground:historical":
-            continue
-        by_date[d] = float(val)
+    by_date: dict[dt.date, float] = {d: float(v) for d, v in cur.fetchall()}
+    skipped_no_wu = sum(1 for d in target_dates if d not in by_date)
+    if skipped_no_wu:
+        log.debug(
+            "EMOS skipped_no_wu=%d / %d for station=%s source=%s lead=%d",
+            skipped_no_wu, len(target_dates), station_id, source, lead_day,
+        )
     y = np.array(
         [by_date.get(d, float("nan")) for d in target_dates], dtype=float
     )
@@ -330,28 +335,77 @@ def _persist_fit(
     )
 
 
+# Process-local LRU for ``latest_fit_for`` (review §5.8).
+#
+# EMOS fits change only when ``fit_postprocess`` re-runs (relatively rare).
+# During a single ``predict --as-of`` sweep we'll consult the same
+# ``(station_id, source, lead_day)`` triple thousands of times. Caching
+# the result avoids that many DB round-trips per sweep. Keyed on
+# ``(station_id, source, lead_day, as_of)`` so the historical-replay path
+# doesn't poison the live cache.
+_LATEST_FIT_CACHE: dict[tuple, "EmosFit | None"] = {}
+_LATEST_FIT_CACHE_MAX = 4096
+
+
+def _cache_latest_fit_invalidate() -> None:
+    """Test/maintenance helper to clear the cache between fixtures."""
+    _LATEST_FIT_CACHE.clear()
+
+
 def latest_fit_for(
     cur,
     *,
     station_id: int,
     source: str,
     lead_day: int,
+    as_of: dt.datetime | None = None,
 ) -> EmosFit | None:
-    cur.execute(
-        """
-        SELECT a, b, c, d, n_train
-        FROM postprocess_coefs
-        WHERE model_id   = %s
-          AND station_id = %s
-          AND source     = %s
-          AND lead_day   = %s
-        ORDER BY fit_at DESC
-        LIMIT 1
-        """,
-        (EMOS_MODEL_ID, station_id, source, lead_day),
-    )
+    """Most recent EMOS fit, optionally bounded to ``fit_at <= as_of`` for
+    historical replay (no leakage from fits done after as_of).
+
+    Memoised in :data:`_LATEST_FIT_CACHE` (Phase 7 review §5.8) for the
+    duration of the process. The cache is keyed on
+    ``(station_id, source, lead_day, as_of)`` and evicted oldest-first
+    when it grows past :data:`_LATEST_FIT_CACHE_MAX` entries.
+    """
+    cache_key = (station_id, source, lead_day, as_of)
+    if cache_key in _LATEST_FIT_CACHE:
+        return _LATEST_FIT_CACHE[cache_key]
+
+    if as_of is None:
+        cur.execute(
+            """
+            SELECT a, b, c, d, n_train
+            FROM postprocess_coefs
+            WHERE model_id   = %s
+              AND station_id = %s
+              AND source     = %s
+              AND lead_day   = %s
+            ORDER BY fit_at DESC
+            LIMIT 1
+            """,
+            (EMOS_MODEL_ID, station_id, source, lead_day),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT a, b, c, d, n_train
+            FROM postprocess_coefs
+            WHERE model_id   = %s
+              AND station_id = %s
+              AND source     = %s
+              AND lead_day   = %s
+              AND fit_at    <= %s
+            ORDER BY fit_at DESC
+            LIMIT 1
+            """,
+            (EMOS_MODEL_ID, station_id, source, lead_day, as_of),
+        )
     row = cur.fetchone()
     if not row:
+        if len(_LATEST_FIT_CACHE) >= _LATEST_FIT_CACHE_MAX:
+            _LATEST_FIT_CACHE.pop(next(iter(_LATEST_FIT_CACHE)))
+        _LATEST_FIT_CACHE[cache_key] = None
         return None
     a, b, c, d, n_train = row
     sigma_const = None
@@ -361,7 +415,7 @@ def latest_fit_for(
         # Treat c as variance constant if d wasn't fitted (legacy fallback).
         sigma_const = math.sqrt(max(c_v, MIN_SIGMA_F**2))
         c_v = None
-    return EmosFit(
+    fit = EmosFit(
         a=float(a) if a is not None else 0.0,
         b=float(b) if b is not None else 1.0,
         c=c_v,
@@ -371,6 +425,10 @@ def latest_fit_for(
         train_crps=float("nan"),
         train_rmse=float("nan"),
     )
+    if len(_LATEST_FIT_CACHE) >= _LATEST_FIT_CACHE_MAX:
+        _LATEST_FIT_CACHE.pop(next(iter(_LATEST_FIT_CACHE)))
+    _LATEST_FIT_CACHE[cache_key] = fit
+    return fit
 
 
 # ---------------------------------------------------------------------------
@@ -379,14 +437,26 @@ def latest_fit_for(
 
 
 DEFAULT_SOURCES = (
+    # Global deterministic NWP (existing).
     "openmeteo:gfs_seamless",
     "openmeteo:ecmwf_ifs04",
     "openmeteo:icon_seamless",
     "openmeteo:gem_seamless",
     "openmeteo:bestmatch",
+    # New Phase 3 sources (review §4.1 / §4.2 / §4.3).
+    "openmeteo:hrrr_conus",
+    "openmeteo:aifs025_single",
+    "openmeteo:gfs_graphcast025",
+    # NBM probabilistic percentiles are pooled at predict time into a
+    # single PercentileCDF; the deterministic ``nbm:station`` and per-
+    # percentile rows are still fit individually so we can compare their
+    # standalone CRPS.
+    "nbm:station",
+    "nbm:p10", "nbm:p25", "nbm:p50", "nbm:p75", "nbm:p90",
+    # NWS public products.
     "nws:gridpoint",
     "nws:daily",
-    "nbm:station",
+    # Ensemble traces.
     "openmeteo_ens:gfs025",
     "openmeteo_ens:ecmwf_ifs04",
     "openmeteo_ens:icon_seamless",
@@ -445,6 +515,10 @@ def fit_postprocess(
         "Postprocess fits=%d skipped_too_few=%d skipped_no_data=%d",
         fits, skipped_too_few, skipped_no_data,
     )
+    # New fits invalidate the predict-time cache (review §5.8). Without
+    # this, a long-running orchestrator process keeps serving stale
+    # coefficients after a refit until restart.
+    _cache_latest_fit_invalidate()
     return {
         "fits": fits,
         "skipped_too_few": skipped_too_few,

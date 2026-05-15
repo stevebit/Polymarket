@@ -76,6 +76,15 @@ def main() -> None:
         default=None,
         help="Also write a JSON bundle for backtest_dashboard / external analysis.",
     )
+    p.add_argument(
+        "--slippage-per-share",
+        type=float,
+        default=0.005,
+        help=(
+            "Per-share slippage haircut subtracted from taker EV before "
+            "sizing (review §5.6). 0 disables. Default 0.5 cents."
+        ),
+    )
     args = p.parse_args()
     configure_logging(args.verbose)
 
@@ -100,6 +109,7 @@ def main() -> None:
         strategy=args.strategy,
         target_spread=args.target_spread,
         take_every_n_snapshots=args.take_every_n_snapshots,
+        slippage_per_share=args.slippage_per_share,
     )
 
     if args.export_json:

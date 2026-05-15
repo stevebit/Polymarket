@@ -151,6 +151,78 @@ class EmpiricalCDF:
         return float(np.std(self.samples, ddof=1))
 
 
+@dataclass(frozen=True)
+class PercentileCDF:
+    """Piecewise-linear CDF built from a fixed set of (probability, value)
+    knots — e.g. NBM probabilistic bulletin's P10 / P25 / P50 / P75 / P90.
+
+    ``quantiles`` and ``values`` are paired, sorted by ``quantiles``
+    ascending. Outside the lowest/highest knot the CDF is clamped (we
+    don't have tail information). Use only with bucket boundaries that
+    fall inside the knot range; otherwise pair this with the model
+    climatology floor.
+    """
+
+    quantiles: tuple[float, ...]
+    values: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.quantiles) != len(self.values):
+            raise ValueError("quantiles and values must be the same length")
+        if len(self.quantiles) < 2:
+            raise ValueError("at least two knots required")
+        if any(
+            self.quantiles[i] >= self.quantiles[i + 1]
+            for i in range(len(self.quantiles) - 1)
+        ):
+            raise ValueError("quantiles must be strictly increasing")
+
+    def cdf(self, x: float) -> float:
+        # Find the interval where ``self.values[i] <= x < self.values[i+1]``.
+        vs = self.values
+        qs = self.quantiles
+        if x <= vs[0]:
+            return qs[0] * (x >= vs[0] - 1e-9)
+        if x >= vs[-1]:
+            return qs[-1] + (1.0 - qs[-1]) * (x > vs[-1] + 1e-9)
+        # Find the bracketing index via linear scan (n is small, e.g. 5).
+        for i in range(len(vs) - 1):
+            if vs[i] <= x <= vs[i + 1]:
+                if vs[i + 1] == vs[i]:
+                    return qs[i + 1]
+                frac = (x - vs[i]) / (vs[i + 1] - vs[i])
+                return float(qs[i] + frac * (qs[i + 1] - qs[i]))
+        return float(qs[-1])
+
+    @property
+    def mean(self) -> float:
+        # Approximate the mean by trapezoid integration of x dF.
+        qs = self.quantiles
+        vs = self.values
+        m = 0.0
+        for i in range(len(qs) - 1):
+            dq = qs[i + 1] - qs[i]
+            m += 0.5 * (vs[i] + vs[i + 1]) * dq
+        # Tail mass below first knot and above last knot is treated as a
+        # point mass at the knot value (consistent with `cdf` clamping).
+        m += vs[0] * qs[0]
+        m += vs[-1] * (1.0 - qs[-1])
+        return float(m)
+
+    @property
+    def std(self) -> float:
+        mu = self.mean
+        qs = self.quantiles
+        vs = self.values
+        var = 0.0
+        for i in range(len(qs) - 1):
+            dq = qs[i + 1] - qs[i]
+            var += 0.5 * ((vs[i] - mu) ** 2 + (vs[i + 1] - mu) ** 2) * dq
+        var += (vs[0] - mu) ** 2 * qs[0]
+        var += (vs[-1] - mu) ** 2 * (1.0 - qs[-1])
+        return float(math.sqrt(max(var, 0.0)))
+
+
 # ---------------------------------------------------------------------------
 # Bucket integration
 # ---------------------------------------------------------------------------
@@ -212,7 +284,11 @@ def realised_bucket(
     buckets: Sequence[BucketBounds],
     observed_max_f: float,
 ) -> BucketBounds | None:
-    v = int(round(observed_max_f))
+    # Half-up rounding (review §2.9): Python's built-in ``round()`` uses
+    # banker's rounding, so e.g. ``round(70.5) == 70`` not 71. That maps
+    # the boundary case to the wrong bucket once every ~100 events. Use
+    # ``floor(x + 0.5)`` for unambiguous "round half up" semantics.
+    v = int(math.floor(observed_max_f + 0.5))
     for b in buckets:
         if b.lo_f is None and b.hi_f is not None and v <= int(b.hi_f):
             return b

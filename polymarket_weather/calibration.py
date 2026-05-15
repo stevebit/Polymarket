@@ -76,10 +76,33 @@ def _fetch_resolved_buckets(
     cur, model_id: str, station_slugs: Sequence[str], lookback_days: int
 ) -> list[tuple]:
     """Return rows of (event_slug, target_date, station_slug, label,
-    lo_f, hi_f, prob, observed_max_f, run_time)."""
+    lo_f, hi_f, prob, observed_max_f, run_time).
+
+    **Determinism fix (review §2.3):** wrap the ``bucket_probs`` scan in a
+    ``DISTINCT ON (event_slug, bucket_label)`` CTE ordered by ``run_time
+    DESC`` with the cutoff ``bp.run_time <= e.target_date + interval '12
+    hours'`` (Polymarket weather markets close 12:00 UTC). Previously the
+    join exploded every historical prediction snapshot into a separate row,
+    so log-loss/Brier depended on which run_time the SQL planner chose
+    first — i.e. results were non-deterministic.
+    """
     cutoff = dt.date.today() - dt.timedelta(days=lookback_days)
     cur.execute(
         """
+        WITH latest_bp AS (
+            SELECT DISTINCT ON (bp.event_slug, bp.bucket_label)
+                bp.event_slug,
+                bp.bucket_label,
+                bp.prob,
+                bp.run_time
+            FROM bucket_probs bp
+            JOIN pm_events e2 ON e2.event_slug = bp.event_slug
+            WHERE bp.model_id   = %s
+              AND e2.target_date <= CURRENT_DATE
+              AND e2.target_date >= %s
+              AND bp.run_time   <= (e2.target_date::timestamp + interval '12 hours')
+            ORDER BY bp.event_slug, bp.bucket_label, bp.run_time DESC
+        )
         SELECT
             e.event_slug,
             e.target_date,
@@ -87,23 +110,21 @@ def _fetch_resolved_buckets(
             b.bucket_label,
             b.lo_f,
             b.hi_f,
-            bp.prob::float8,
+            lb.prob::float8,
             o.observed_max_f::float8,
-            bp.run_time
-        FROM bucket_probs bp
-        JOIN pm_events  e ON e.event_slug = bp.event_slug
-        JOIN pm_buckets b ON b.event_slug = bp.event_slug
-                          AND b.bucket_label = bp.bucket_label
+            lb.run_time
+        FROM latest_bp lb
+        JOIN pm_events  e ON e.event_slug = lb.event_slug
+        JOIN pm_buckets b ON b.event_slug = lb.event_slug
+                          AND b.bucket_label = lb.bucket_label
         JOIN stations   s ON s.station_id   = e.station_id
         JOIN observations o
                           ON o.station_id   = e.station_id
                          AND o.obs_date     = e.target_date
                          AND o.observed_max_f IS NOT NULL
                          AND o.finalized   = TRUE
-        WHERE bp.model_id   = %s
-          AND e.target_date <= CURRENT_DATE
-          AND e.target_date >= %s
-          AND s.slug = ANY(%s)
+        WHERE s.slug = ANY(%s)
+        ORDER BY e.event_slug, b.bucket_label
         """,
         (model_id, cutoff, list(station_slugs)),
     )
@@ -302,8 +323,12 @@ def run_calibration(
         hi,
         prob,
         observed,
-        _run,
+        run_time,
     ) in rows:
+        # ``run_time`` is now the DISTINCT-ON latest bp.run_time per
+        # (event, bucket). Use it for forecast-lead-day labelling
+        # (review §2.10) instead of (today - target_date) which measured
+        # days since resolution.
         e = by_event.setdefault(
             event_slug,
             {
@@ -312,6 +337,9 @@ def run_calibration(
                 "observed_max_f": float(observed),
                 "buckets": [],
                 "probs": {},
+                "lead_days": (target_date - run_time.date()).days
+                if run_time is not None
+                else None,
             },
         )
         bb = _bucket_bounds_from_row(label, lo, hi)
@@ -321,6 +349,7 @@ def run_calibration(
         e["probs"][label] = 0.0 if prob is None else float(prob)
 
     event_scores: list[EventScore] = []
+    event_lead: dict[str, int | None] = {}
     for slug, e in by_event.items():
         realised = realised_bucket(e["buckets"], e["observed_max_f"])
         if realised is None:
@@ -344,6 +373,7 @@ def run_calibration(
                 brier=br,
             )
         )
+        event_lead[slug] = e.get("lead_days")
         for label, p in probs.items():
             pred_pairs.append((p, 1 if label == realised.label else 0))
 
@@ -376,10 +406,15 @@ def run_calibration(
             v["log_loss"] /= v["n"]
             v["brier"] /= v["n"]
 
+    # Lead-time slice: ``lead = target_date - bp.run_time.date()`` measures
+    # the forecast *horizon* the model was working with (review §2.10).
+    # Falls back to "days since resolution" only when run_time is absent.
     by_lead: dict[int, dict[str, float]] = {}
     today = dt.date.today()
     for es in event_scores:
-        lead = (today - es.target_date).days
+        lead = event_lead.get(es.event_slug)
+        if lead is None:
+            lead = (today - es.target_date).days
         bucket = by_lead.setdefault(lead, {"n": 0, "log_loss": 0.0, "brier": 0.0})
         bucket["n"] += 1
         bucket["log_loss"] += es.log_loss
@@ -512,7 +547,7 @@ def _render_report(
         lines.append("| — | — | — | — |")
     lines.append("")
 
-    lines.append("## By lead time (days resolution → today)")
+    lines.append("## By forecast lead time (target_date − bp.run_time, days)")
     lines.append("")
     lines.append("| lead_days | n | log-loss | brier |")
     lines.append("|---:|---:|---:|---:|")

@@ -16,7 +16,12 @@ from ..models.postprocess import (
     DEFAULT_SOURCES,
     fit_postprocess,
 )
-from ._common import add_common_args, configure_logging, parse_stations
+from ._common import (
+    add_common_args,
+    configure_logging,
+    parse_cli_date,
+    parse_stations,
+)
 
 
 def main() -> None:
@@ -30,9 +35,12 @@ def main() -> None:
     )
     p.add_argument(
         "--end-date",
-        type=lambda s: dt.date.fromisoformat(s),
+        type=parse_cli_date,
         default=None,
-        help="Last observation date to include in training (default today).",
+        help=(
+            "Last observation date in training: YYYY-MM-DD or today/yesterday "
+            "(UTC). Default today UTC."
+        ),
     )
     p.add_argument(
         "--sources",
@@ -54,11 +62,15 @@ def main() -> None:
     sources = tuple(s.strip() for s in args.sources.split(",") if s.strip())
     leads = tuple(int(s.strip()) for s in args.leads.split(",") if s.strip())
 
+    end_date = args.end_date
+    if end_date is None:
+        end_date = dt.datetime.now(dt.timezone.utc).date()
+
     counts = fit_postprocess(
         parse_stations(args.station),
         sources=sources,
         lead_days=leads,
-        end_date=args.end_date,
+        end_date=end_date,
         lookback_days=args.lookback_days,
     )
     print(

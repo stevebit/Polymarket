@@ -20,7 +20,7 @@ from . import config
 from .db import with_conn
 from .recommend import EventRecommendation, build_recommendations
 from .score import BucketBounds, realised_bucket
-from .strategy.edge import Action, FeeSchedule
+from .strategy.edge import Action, FeeSchedule, fee_per_share
 from .strategy.sizing import CapsConfig, SizedOrder, tiny_bankroll_caps
 
 log = logging.getLogger(__name__)
@@ -290,21 +290,25 @@ def settle_paper_trades(
                 continue
             won = bucket_label == realised_label
             payoff = 1.0 if won else 0.0
+            # Polymarket CLOB v2 symmetric fee: rate * p * (1 - p) per share.
+            # Makers pay 0; takers pay the weather-category rate (0.05).
+            taker_fee_rate = 0.05
             if side in ("taker_buy", "maker_buy"):
                 per_share = payoff - float(price)
-                # Fee already accounted for in expected_value_usd, but for
-                # realised PnL we re-deduct taker fee explicitly because
-                # ``realised_pnl_usd`` is gross-of-fees in our ledger.
-                fee_per_share = (
-                    0.05 * float(price) if side == "taker_buy" else 0.0
+                fee_ps = (
+                    fee_per_share(float(price), taker_fee_rate)
+                    if side == "taker_buy"
+                    else 0.0
                 )
-                pnl = per_share * shares - fee_per_share * shares
+                pnl = per_share * shares - fee_ps * shares
             elif side in ("taker_sell", "maker_sell"):
                 per_share = float(price) - payoff
-                fee_per_share = (
-                    0.05 * float(price) if side == "taker_sell" else 0.0
+                fee_ps = (
+                    fee_per_share(float(price), taker_fee_rate)
+                    if side == "taker_sell"
+                    else 0.0
                 )
-                pnl = per_share * shares - fee_per_share * shares
+                pnl = per_share * shares - fee_ps * shares
             else:
                 pnl = 0.0
             pnl_total += pnl

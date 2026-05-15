@@ -410,7 +410,17 @@ def replay_backtest(
     target_spread: float = 0.04,
     max_open_orders_per_event: int = 4,
     take_every_n_snapshots: int = 1,
+    slippage_per_share: float = 0.005,
 ) -> BacktestResult:
+    """Replay historical snapshots and simulate fills.
+
+    ``slippage_per_share`` is subtracted from every **taker** edge's
+    ``ev_per_share`` before sizing (review §5.6). Polymarket's CLOB
+    typically shows 0.5–1 cent of effective slippage on weather-category
+    sub-markets because the top-of-book size is small relative to the
+    size we want to take. Setting this to 0 reproduces the legacy
+    no-slippage behaviour.
+    """
     station_list = list(station_slugs) if station_slugs is not None else config.station_slugs()
 
     with with_conn() as conn, conn.cursor() as cur:
@@ -569,10 +579,24 @@ def replay_backtest(
                     bb = BucketBook(yes=yes_book, no=no_book)
                     edge = best_taker_edge(p_yes, bb, fees=fees)
                     if edge is not None:
+                        # Slippage haircut (review §5.6): assume we cross
+                        # the spread by ``slippage_per_share`` cents on
+                        # average, so EV (and the executed price) are
+                        # adjusted before the sizing decision.
+                        if slippage_per_share > 0:
+                            from dataclasses import replace
+                            edge = replace(
+                                edge,
+                                ev_per_share=edge.ev_per_share - slippage_per_share,
+                            )
                         n_taker_edges_found += 1
-                        sized = size_edge(edge, caps=caps, state=state)
+                        if edge.ev_per_share > 0:
+                            sized = size_edge(edge, caps=caps, state=state)
+                        else:
+                            sized = None
                         if sized is not None:
                             fee_total = sized.shares * edge.fee_per_share
+                            slippage_total = sized.shares * slippage_per_share
                             fills_taker.append(
                                 _Fill(
                                     event_slug=ev,
@@ -586,12 +610,12 @@ def replay_backtest(
                                     shares=sized.shares,
                                     p_model_at_post=p_yes,
                                     expected_pnl_per_share_at_post=edge.ev_per_share,
-                                    fee_usd=fee_total,
+                                    fee_usd=fee_total + slippage_total,
                                     posted_at=snap_time,
                                     filled_at=snap_time,
                                 )
                             )
-                            fees_paid += fee_total
+                            fees_paid += fee_total + slippage_total
                             n_taker_filled += 1
                             state = CapsState(
                                 used_per_bucket=state.used_per_bucket,

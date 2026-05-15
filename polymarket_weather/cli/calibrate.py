@@ -8,6 +8,7 @@ import argparse
 from ..calibration import MODEL_MARKET_MID, run_calibration
 from ..db import init_schema_and_seed
 from ..models.baseline import MODEL_M0, MODEL_M1
+from ..models.m2_postprocessed_ensemble import MODEL_M2
 from ._common import add_common_args, configure_logging, parse_stations
 
 
@@ -16,7 +17,9 @@ def main() -> None:
     add_common_args(p, with_date=False)
     p.add_argument(
         "--model",
-        default=f"{MODEL_M0},{MODEL_M1}",
+        # Phase 6: include M2 by default so the like-for-like comparison
+        # report is one invocation away.
+        default=f"{MODEL_M0},{MODEL_M1},{MODEL_M2}",
         help="Comma-separated model_id list. One report per model.",
     )
     p.add_argument(

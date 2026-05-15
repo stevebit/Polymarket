@@ -3,11 +3,20 @@
 Polymarket weather markets carry the following structure (per Gamma's
 ``feeSchedule`` field on each sub-market):
 
-* ``rate``: 0.05 (5% taker fee on notional traded)
+* ``rate``: 0.05 (5% **base rate** for weather category)
 * ``takerOnly``: true (makers do not pay fees)
 * ``rebateRate``: 0.25 (interpreted as a maker-side rebate fraction tied to
   the liquidity-rewards program; Polymarket's exact accounting is verified
   in Phase 6 by a small live trade)
+
+**Fee formula** (CLOB v2, symmetric):
+
+    fee_per_share = rate * p * (1 - p)
+
+where ``p`` is the trade price in [0, 1]. The fee peaks at $0.0125/share at
+``p=0.5`` and **decays to zero at both tails**. Earlier versions of this
+module used a linear ``fee = rate * p`` approximation that overstates fees
+by up to 20x at the high-price tail. See ``fee_per_share`` below.
 
 Plus the per-market liquidity rewards via ``clobRewards``:
 
@@ -57,6 +66,22 @@ class FeeSchedule:
     rewards_min_size: float = DEFAULT_REWARDS_MIN_SIZE
 
 
+def fee_per_share(price: float, rate: float) -> float:
+    """Polymarket CLOB v2 symmetric fee.
+
+    ``fee = rate * p * (1 - p)`` per share, where ``p`` is the trade price.
+    Returns 0 outside the valid ``(0, 1)`` price range so callers can chain
+    without an extra guard.
+
+    Examples (rate=0.05):
+        p=0.10 -> 0.0045 ; p=0.30 -> 0.0105 ; p=0.50 -> 0.0125
+        p=0.70 -> 0.0105 ; p=0.90 -> 0.0045 ; p=0.95 -> 0.002375
+    """
+    if price <= 0.0 or price >= 1.0 or rate <= 0.0:
+        return 0.0
+    return rate * price * (1.0 - price)
+
+
 @dataclass(frozen=True)
 class BookLevel:
     """Top-of-book snapshot for a single token."""
@@ -102,7 +127,7 @@ def taker_buy_yes_edge(
 ) -> Edge | None:
     if ask_yes is None or ask_yes <= 0 or ask_yes >= 1:
         return None
-    fee = fees.taker_fee * ask_yes
+    fee = fee_per_share(ask_yes, fees.taker_fee)
     gross = p_yes * 1.0 - ask_yes
     ev = gross - fee
     return Edge(
@@ -122,13 +147,13 @@ def taker_sell_yes_edge(
 ) -> Edge | None:
     """Sell a YES we hold (or get short via taker fill on the bid).
 
-    Cash flow: receive ``bid_yes`` per share now, pay ``bid_yes * fee`` taker
-    fee, give up ``p_yes`` of expected dollar (since the YES would have paid
-    1 if it won).
+    Cash flow: receive ``bid_yes`` per share now, pay
+    ``rate * bid_yes * (1 - bid_yes)`` taker fee, give up ``p_yes`` of
+    expected dollar (since the YES would have paid 1 if it won).
     """
     if bid_yes is None or bid_yes <= 0 or bid_yes >= 1:
         return None
-    fee = fees.taker_fee * bid_yes
+    fee = fee_per_share(bid_yes, fees.taker_fee)
     gross = bid_yes - p_yes
     ev = gross - fee
     return Edge(
@@ -148,7 +173,7 @@ def taker_buy_no_edge(
 ) -> Edge | None:
     if ask_no is None or ask_no <= 0 or ask_no >= 1:
         return None
-    fee = fees.taker_fee * ask_no
+    fee = fee_per_share(ask_no, fees.taker_fee)
     p_no = 1.0 - p_yes
     gross = p_no - ask_no
     ev = gross - fee
@@ -193,7 +218,7 @@ def maker_quote_yes_edge(
     else:
         return None
 
-    fee = fees.maker_fee * quote_price
+    fee = fee_per_share(quote_price, fees.maker_fee)
     ev = scaled_gross + reward_per_share - fee
     return Edge(
         side=Side.YES,
@@ -249,6 +274,34 @@ def best_taker_edge(
     return max(candidates, key=lambda c: c.ev_per_share)
 
 
+def fill_prob_estimator(
+    distance_from_mid: float | None,
+    lead_days: int | None,
+    station: str | None,
+) -> float:
+    """Maker fill probability.
+
+    Consults :func:`polymarket_weather.models.maker_fill.fill_prob` for
+    the learned logistic curve when one has been persisted in
+    ``maker_fill_coefs`` (Phase 7). Falls back to a conservative 0.10
+    default when no fit exists yet — significantly more pessimistic than
+    the old hard-coded 0.5 — so EV is not inflated by an optimistic fill
+    rate.
+    """
+    _ = station  # station-conditional curves are a Phase 7+ extension
+    try:
+        # Local import keeps the strategy module DB-free at import time.
+        from ..models.maker_fill import fill_prob as _learned
+
+        p = _learned(distance_from_mid, lead_days)
+        if p is not None:
+            # Conservative floor: never trust the curve below 5%.
+            return max(0.05, min(0.95, float(p)))
+    except Exception:  # noqa: BLE001
+        pass
+    return 0.10
+
+
 def maker_quote_yes_within_rewards(
     p_yes: float,
     book: BookLevel,
@@ -257,15 +310,24 @@ def maker_quote_yes_within_rewards(
     reward_per_share: float = 0.0,
     fees: FeeSchedule = FeeSchedule(),
     min_fill_prob: float = 0.10,
+    min_edge: float = 0.0,
+    lead_days: int | None = None,
+    station: str | None = None,
 ) -> tuple[Edge | None, Edge | None]:
     """Pick a buy quote at ``p_model - target_spread/2`` and a sell quote at
     ``p_model + target_spread/2``, clipped to the current book by 1 tick.
 
     Returns ``(buy_edge, sell_edge)`` with EV per posted share.
 
-    ``min_fill_prob`` is a heuristic: fills decrease quickly as you cross
-    inside the spread. We don't model queue position — Phase 4 backtest
-    will replace this with realised fill rate.
+    **Direction guard (review §2.5):** the buy side is suppressed when the
+    model doesn't think YES is undervalued (``p_yes <= mid + min_edge``)
+    and the sell side is suppressed when YES isn't overvalued
+    (``p_yes >= mid - min_edge``). Without this, even a perfectly fair
+    model posts both quotes whenever the spread is wider than the rewards
+    band, which is wrong on direction.
+
+    Fill probability comes from :func:`fill_prob_estimator` (currently a
+    conservative 0.10 default; Phase 7 swaps in a learned curve).
     """
     if book.best_bid is None and book.best_ask is None:
         return None, None
@@ -283,7 +345,25 @@ def maker_quote_yes_within_rewards(
     if mid is None and book.best_bid is not None and book.best_ask is not None:
         mid = (book.best_bid + book.best_ask) / 2.0
 
-    fill_prob = max(min_fill_prob, 0.5)  # placeholder; backtest replaces this
+    # Direction guard: suppress quotes the model doesn't actually support.
+    # Asymmetric example: p_model=0.20, mid=0.30. We should NOT post a buy
+    # at 0.18 (we'd be paying to buy something the model says is below mid).
+    # We SHOULD consider posting a sell at 0.32 (model says it's overpriced).
+    allow_buy = mid is None or p_yes > mid + min_edge
+    allow_sell = mid is None or p_yes < mid - min_edge
+
+    fill_buy = max(
+        min_fill_prob,
+        fill_prob_estimator(
+            None if mid is None else abs(target_buy - mid), lead_days, station,
+        ),
+    )
+    fill_sell = max(
+        min_fill_prob,
+        fill_prob_estimator(
+            None if mid is None else abs(target_sell - mid), lead_days, station,
+        ),
+    )
     buy_reward = sell_reward = 0.0
     if mid is not None and reward_per_share > 0:
         if abs(target_buy - mid) <= fees.rewards_max_spread:
@@ -291,20 +371,28 @@ def maker_quote_yes_within_rewards(
         if abs(target_sell - mid) <= fees.rewards_max_spread:
             sell_reward = reward_per_share
 
-    buy_edge = maker_quote_yes_edge(
-        p_yes,
-        target_buy,
-        side=Action.MAKER_BUY,
-        fill_prob=fill_prob,
-        reward_per_share=buy_reward,
-        fees=fees,
+    buy_edge = (
+        maker_quote_yes_edge(
+            p_yes,
+            target_buy,
+            side=Action.MAKER_BUY,
+            fill_prob=fill_buy,
+            reward_per_share=buy_reward,
+            fees=fees,
+        )
+        if allow_buy
+        else None
     )
-    sell_edge = maker_quote_yes_edge(
-        p_yes,
-        target_sell,
-        side=Action.MAKER_SELL,
-        fill_prob=fill_prob,
-        reward_per_share=sell_reward,
-        fees=fees,
+    sell_edge = (
+        maker_quote_yes_edge(
+            p_yes,
+            target_sell,
+            side=Action.MAKER_SELL,
+            fill_prob=fill_sell,
+            reward_per_share=sell_reward,
+            fees=fees,
+        )
+        if allow_sell
+        else None
     )
     return buy_edge, sell_edge
