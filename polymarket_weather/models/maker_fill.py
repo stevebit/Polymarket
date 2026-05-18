@@ -139,13 +139,50 @@ def latest_maker_fill_fit() -> MakerFillFit | None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Process-local cache
+# ---------------------------------------------------------------------------
+#
+# Without a cache, ``fill_prob`` opens a DB connection per call. The backtest
+# replay invokes ``fill_prob_estimator`` once per (snapshot, bucket, side),
+# which for a year of dual-anchor data is ~250k round-trips at >50ms latency
+# on Azure Postgres. Treat the fit as constant within one process run; call
+# :func:`invalidate_maker_fill_cache` after a re-fit if a long-running process
+# (e.g. ``run_loop``) needs to pick up the new coefficients.
+
+_FIT_CACHE: dict[str, MakerFillFit | None] = {}
+_FIT_LOADED: bool = False
+
+
+def cached_maker_fill_fit() -> MakerFillFit | None:
+    """Return the cached :func:`latest_maker_fill_fit`. First call hits the
+    DB; subsequent calls within the same process return the cached value."""
+    global _FIT_LOADED
+    if not _FIT_LOADED:
+        _FIT_CACHE["latest"] = latest_maker_fill_fit()
+        _FIT_LOADED = True
+    return _FIT_CACHE["latest"]
+
+
+def invalidate_maker_fill_cache() -> None:
+    """Force the next ``cached_maker_fill_fit`` call to re-read the DB."""
+    global _FIT_LOADED
+    _FIT_LOADED = False
+    _FIT_CACHE.clear()
+
+
 def fill_prob(
     distance_from_mid: float | None,
     lead_days: float | None,
 ) -> float | None:
     """Return the learned maker fill probability, or ``None`` if no fit
-    has been persisted yet (caller keeps its conservative default)."""
-    fit = latest_maker_fill_fit()
+    has been persisted yet (caller keeps its conservative default).
+
+    Uses :func:`cached_maker_fill_fit`, so the DB is hit at most once per
+    process — the hot-loop callers (e.g. the backtest's per-snapshot maker
+    quote evaluation) no longer pay an Azure round-trip per bucket.
+    """
+    fit = cached_maker_fill_fit()
     if fit is None:
         return None
     return _logit_predict(

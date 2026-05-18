@@ -221,6 +221,42 @@ def persist_isotonic_fit(fit: IsotonicFit) -> None:
         )
 
 
+_FIT_CACHE: dict[str, IsotonicFit | None] = {}
+_FIT_CACHE_LOADED: set[str] = set()
+
+
+def cached_isotonic_fit(model_id: str) -> IsotonicFit | None:
+    """Lightweight per-process cache for :func:`latest_isotonic_fit`.
+
+    The fit changes only when ``fit_isotonic`` is re-run and is consulted on
+    every event during a tick. Caching avoids an extra DB round-trip per
+    event without introducing staleness within a single tick. Call
+    :func:`invalidate_isotonic_cache` after a re-fit if you want freshness
+    inside one long-running process.
+    """
+    if model_id in _FIT_CACHE_LOADED:
+        return _FIT_CACHE.get(model_id)
+    try:
+        fit = latest_isotonic_fit(model_id)
+    except Exception as exc:  # noqa: BLE001
+        log.info("Isotonic fit lookup failed for %s: %s", model_id, exc)
+        fit = None
+    _FIT_CACHE[model_id] = fit
+    _FIT_CACHE_LOADED.add(model_id)
+    return fit
+
+
+def invalidate_isotonic_cache(model_id: str | None = None) -> None:
+    """Drop cached fits so the next ``cached_isotonic_fit`` call re-reads
+    the DB. Pass ``None`` to clear all entries."""
+    if model_id is None:
+        _FIT_CACHE.clear()
+        _FIT_CACHE_LOADED.clear()
+    else:
+        _FIT_CACHE.pop(model_id, None)
+        _FIT_CACHE_LOADED.discard(model_id)
+
+
 def latest_isotonic_fit(model_id: str) -> IsotonicFit | None:
     with with_conn() as conn, conn.cursor() as cur:
         cur.execute(

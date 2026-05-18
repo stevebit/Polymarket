@@ -36,7 +36,11 @@ log = logging.getLogger(__name__)
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", required=True, help="model_id to fit.")
+    p.add_argument(
+        "--model",
+        required=True,
+        help="Comma-separated model_id list to fit (e.g. m1_ensemble_gaussian,m2_postprocessed_ens).",
+    )
     p.add_argument("--lookback-days", type=int, default=90)
     p.add_argument(
         "--force",
@@ -51,28 +55,40 @@ def main() -> None:
     if not args.no_migrate:
         init_schema_and_seed()
 
-    with with_conn() as conn, conn.cursor() as cur:
-        xs, ys = _fetch_flattened_pairs(cur, args.model, args.lookback_days)
+    model_ids = [m.strip() for m in args.model.split(",") if m.strip()]
+    if not model_ids:
+        print("--model parsed to an empty list", file=sys.stderr)
+        sys.exit(2)
 
-    if xs.size == 0:
-        print(f"[{args.model}] no resolved data — nothing to fit.")
-        sys.exit(1)
+    any_failed = False
+    for model_id in model_ids:
+        with with_conn() as conn, conn.cursor() as cur:
+            xs, ys = _fetch_flattened_pairs(cur, model_id, args.lookback_days)
 
-    if not args.force and not isotonic_recommended(xs, ys):
+        if xs.size == 0:
+            print(f"[{model_id}] no resolved data — nothing to fit.")
+            any_failed = True
+            continue
+
+        if not args.force and not isotonic_recommended(xs, ys):
+            print(
+                f"[{model_id}] reliability bins do NOT show consistent off-diagonal "
+                "miscalibration; skipping fit. Pass --force to fit anyway."
+            )
+            continue
+
+        fit = fit_isotonic(model_id, lookback_days=args.lookback_days)
+        if fit is None:
+            print(f"[{model_id}] fit_isotonic returned None — too few pairs.")
+            any_failed = True
+            continue
         print(
-            f"[{args.model}] reliability bins do NOT show consistent off-diagonal "
-            "miscalibration; skipping fit. Pass --force to fit anyway."
+            f"[{fit.model_id}] fit n_train={fit.n_train} knots={len(fit.x_knots)} "
+            f"train_brier={fit.train_brier:.4f} train_logloss={fit.train_logloss:.4f}"
         )
-        return
 
-    fit = fit_isotonic(args.model, lookback_days=args.lookback_days)
-    if fit is None:
-        print(f"[{args.model}] fit_isotonic returned None — too few pairs.")
+    if any_failed:
         sys.exit(1)
-    print(
-        f"[{fit.model_id}] fit n_train={fit.n_train} knots={len(fit.x_knots)} "
-        f"train_brier={fit.train_brier:.4f} train_logloss={fit.train_logloss:.4f}"
-    )
 
 
 if __name__ == "__main__":

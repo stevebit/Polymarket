@@ -558,9 +558,24 @@ def run_predictions(
                 if not events or not preds:
                     continue
 
+                # Phase 6: optional per-model isotonic recalibration applied
+                # right before persistence. ``apply_isotonic`` renormalises so
+                # probs still sum to 1; ``cached_isotonic_fit`` returns
+                # ``None`` when no fit has been persisted, which is the
+                # untouched-baseline behaviour. We resolve fits once per
+                # (station, target) cell, not once per event, to amortise the
+                # DB read across the inner loop.
+                from .isotonic import apply_isotonic, cached_isotonic_fit
+
+                iso_fits: dict[str, "object | None"] = {
+                    p.model_id: cached_isotonic_fit(p.model_id) for p in preds
+                }
                 for event_slug, buckets in events:
                     for p in preds:
                         probs = event_probabilities(buckets, p.mean_f, p.std_f)
+                        iso_fit = iso_fits.get(p.model_id)
+                        if iso_fit is not None:
+                            probs = apply_isotonic(iso_fit, probs)
                         _persist_event_probs(
                             cur,
                             model_id=p.model_id,

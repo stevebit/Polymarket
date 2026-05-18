@@ -273,28 +273,11 @@ def _today_for_station(cur, station_id: int) -> dt.date | None:
 
 
 def _get_isotonic_fit_cached(model_id: str):
-    """Lightweight per-process cache for ``latest_isotonic_fit``.
+    """Backwards-compatible shim around the now-shared
+    :func:`polymarket_weather.models.isotonic.cached_isotonic_fit`."""
+    from .isotonic import cached_isotonic_fit
 
-    The fit is small (a pair of arrays), changes only when
-    ``fit_isotonic`` is re-run, and is consulted on **every** event during
-    a tick. Caching avoids an extra DB round-trip per event without
-    introducing staleness within a single tick.
-    """
-    # Late import keeps the M2 module light during unit-test imports.
-    from .isotonic import latest_isotonic_fit
-
-    cache = _get_isotonic_fit_cached
-    fit = getattr(cache, "_cache", {}).get(model_id, "SENTINEL")
-    if fit == "SENTINEL":
-        try:
-            fit = latest_isotonic_fit(model_id)
-        except Exception as exc:  # noqa: BLE001
-            log.info("Isotonic fit lookup failed for %s: %s", model_id, exc)
-            fit = None
-        if not hasattr(cache, "_cache"):
-            cache._cache = {}
-        cache._cache[model_id] = fit
-    return fit
+    return cached_isotonic_fit(model_id)
 
 
 def _try_fetch_nowcast(station_id: int, target_date: dt.date):
