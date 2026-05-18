@@ -85,8 +85,27 @@ def main() -> None:
             "sizing (review §5.6). 0 disables. Default 0.5 cents."
         ),
     )
+    p.add_argument(
+        "--min-snapshot-utc-hour",
+        type=int,
+        default=None,
+        metavar="H",
+        help=(
+            "Only load snapshots whose clock hour in UTC is >= H (0..23). "
+            "Use with model runs anchored at UTC noon, e.g. --book-alignment "
+            "utc-noon on predict_history."
+        ),
+    )
     args = p.parse_args()
     configure_logging(args.verbose)
+
+    if args.min_snapshot_utc_hour is not None and not (
+        0 <= args.min_snapshot_utc_hour <= 23
+    ):
+        raise SystemExit(
+            "--min-snapshot-utc-hour must be in [0, 23], "
+            f"got {args.min_snapshot_utc_hour}"
+        )
 
     caps = CapsConfig(
         bankroll_usd=args.bankroll,
@@ -110,6 +129,7 @@ def main() -> None:
         target_spread=args.target_spread,
         take_every_n_snapshots=args.take_every_n_snapshots,
         slippage_per_share=args.slippage_per_share,
+        min_snapshot_utc_hour=args.min_snapshot_utc_hour,
     )
 
     if args.export_json:

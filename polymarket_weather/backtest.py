@@ -146,9 +146,16 @@ def _fetch_snapshots(
     station_slugs: list[str],
     start: dt.date,
     end: dt.date,
+    min_snapshot_utc_hour: int | None = None,
 ) -> list[tuple]:
     """Return ``(event_slug, station_slug, target_date, bucket_label, lo_f,
-    hi_f, snapshot_at, best_bid, best_ask, mid)`` ordered by snapshot_at."""
+    hi_f, snapshot_at, best_bid, best_ask, mid)`` ordered by snapshot_at.
+
+    When ``min_snapshot_utc_hour`` is set (0..23), drop rows whose
+    ``snapshot_at`` wall-clock hour in **UTC** is strictly before that hour —
+    useful to align with model ``run_time`` anchors at UTC noon (12) instead
+    of midnight (0).
+    """
     cur.execute(
         """
         SELECT
@@ -169,9 +176,12 @@ def _fetch_snapshots(
         JOIN stations   s ON s.station_id = e.station_id
         WHERE e.target_date BETWEEN %s AND %s
           AND s.slug = ANY(%s)
+          AND (%s::int IS NULL OR EXTRACT(
+                HOUR FROM ms.snapshot_at AT TIME ZONE 'UTC'
+              ) >= %s::int)
         ORDER BY ms.snapshot_at, e.event_slug, b.bucket_label
         """,
-        (start, end, station_slugs),
+        (start, end, station_slugs, min_snapshot_utc_hour, min_snapshot_utc_hour),
     )
     return list(cur.fetchall())
 
@@ -411,6 +421,7 @@ def replay_backtest(
     max_open_orders_per_event: int = 4,
     take_every_n_snapshots: int = 1,
     slippage_per_share: float = 0.005,
+    min_snapshot_utc_hour: int | None = None,
 ) -> BacktestResult:
     """Replay historical snapshots and simulate fills.
 
@@ -420,7 +431,18 @@ def replay_backtest(
     sub-markets because the top-of-book size is small relative to the
     size we want to take. Setting this to 0 reproduces the legacy
     no-slippage behaviour.
+
+    ``min_snapshot_utc_hour``: when set, only snapshots whose timestamp's
+    hour in **UTC** is ``>=`` this value are loaded (pair with
+    ``predict_history --book-alignment utc-noon`` runs at hour 12).
     """
+    if min_snapshot_utc_hour is not None and not (
+        0 <= int(min_snapshot_utc_hour) <= 23
+    ):
+        raise ValueError(
+            f"min_snapshot_utc_hour must be in [0, 23], got {min_snapshot_utc_hour!r}"
+        )
+
     station_list = list(station_slugs) if station_slugs is not None else config.station_slugs()
 
     with with_conn() as conn, conn.cursor() as cur:
@@ -429,6 +451,7 @@ def replay_backtest(
             station_slugs=station_list,
             start=start,
             end=end,
+            min_snapshot_utc_hour=min_snapshot_utc_hour,
         )
         history = _fetch_bucket_probs_history(
             cur,
@@ -452,6 +475,8 @@ def replay_backtest(
     snapshot_stats = _snapshot_time_stats(snap_times)
     snapshot_stats["take_every_n_snapshots"] = take_n
     snapshot_stats["total_snapshots_in_db"] = len(grouped)
+    if min_snapshot_utc_hour is not None:
+        snapshot_stats["min_snapshot_utc_hour"] = int(min_snapshot_utc_hour)
 
     # Per-event open maker orders.
     open_orders: dict[str, list[_OpenOrder]] = {}
@@ -749,6 +774,11 @@ def replay_backtest(
             f"({len(snap_times)} of {len(grouped)} total) — coarser book path, "
             "useful when stress-testing maker fill assumptions."
         )
+    if min_snapshot_utc_hour is not None:
+        notes_bt.append(
+            f"Snapshots restricted to UTC hour >= {min_snapshot_utc_hour} "
+            "(align with model run_time anchor, e.g. noon replays)."
+        )
 
     return BacktestResult(
         n_snapshots=len(snap_times),
@@ -930,6 +960,10 @@ def render_backtest_markdown(
         if ss.get("take_every_n_snapshots", 1) > 1:
             lines.append(
                 f"- Subsample: every **{ss['take_every_n_snapshots']}** snapshot(s)"
+            )
+        if ss.get("min_snapshot_utc_hour") is not None:
+            lines.append(
+                f"- Min snapshot **UTC** hour: **{ss['min_snapshot_utc_hour']}** (filter)"
             )
     if result.notes:
         lines.append("")

@@ -13,7 +13,15 @@ which is what the calibration SQL (Phase 1c DISTINCT-ON) and the
 Run roughly:
 
     python -m polymarket_weather.cli.predict_history \\
-        --start 2025-11-01 --end 2026-05-12 --cutoff-hour 12
+        --start 2025-11-01 --end 2026-05-12 --book-alignment utc-noon
+    python -m polymarket_weather.cli.predict_history \\
+        --start 2025-11-01 --end 2026-05-12 --book-alignment utc-midnight
+
+Use ``utc-midnight`` (00:00 UTC ``run_time``) when replaying **intraday**
+CLOB snapshots so ``run_time <= snapshot_at`` holds for morning books.
+``utc-noon`` (12:00 UTC) matches the legacy daily anchor. With ``utc-noon``,
+pair backtests using ``--min-snapshot-utc-hour 12`` or accept only afternoon
+books.
 
 This is the long-running driver behind the Phase 6 like-for-like
 calibration. Each (date, station, model) triple is cheap; the wall-clock
@@ -62,8 +70,22 @@ def main() -> None:
         help="Inclusive end date: YYYY-MM-DD or today/yesterday (UTC). Default today UTC.",
     )
     p.add_argument(
-        "--cutoff-hour", type=int, default=12,
-        help="UTC hour used for the as-of anchor (default 12, market close).",
+        "--cutoff-hour",
+        type=int,
+        default=12,
+        help=(
+            "UTC hour for the as-of anchor when --book-alignment from-cutoff-hour "
+            "(default). Ignored when alignment is utc-midnight or utc-noon."
+        ),
+    )
+    p.add_argument(
+        "--book-alignment",
+        choices=("from-cutoff-hour", "utc-midnight", "utc-noon"),
+        default="from-cutoff-hour",
+        help=(
+            "utc-midnight → cutoff 0 (intraday books). utc-noon → cutoff 12. "
+            "from-cutoff-hour → use --cutoff-hour only (default)."
+        ),
     )
     p.add_argument(
         "--days-ahead", type=int, default=0,
@@ -86,8 +108,24 @@ def main() -> None:
 
     if args.end < args.start:
         raise SystemExit(f"--end {args.end} is before --start {args.start}")
-    if not (0 <= args.cutoff_hour <= 23):
-        raise SystemExit(f"--cutoff-hour must be in [0, 23], got {args.cutoff_hour}")
+
+    if args.book_alignment == "utc-midnight":
+        eff_cutoff = 0
+    elif args.book_alignment == "utc-noon":
+        eff_cutoff = 12
+    else:
+        eff_cutoff = args.cutoff_hour
+
+    if not (0 <= eff_cutoff <= 23):
+        raise SystemExit(
+            f"effective UTC cutoff hour must be in [0, 23], got {eff_cutoff}"
+        )
+    if args.book_alignment == "from-cutoff-hour" and not (
+        0 <= args.cutoff_hour <= 23
+    ):
+        raise SystemExit(
+            f"--cutoff-hour must be in [0, 23], got {args.cutoff_hour}"
+        )
 
     stations = parse_stations(args.station)
     models = tuple(m.strip() for m in args.models.split(",") if m.strip())
@@ -102,7 +140,7 @@ def main() -> None:
     while day <= args.end:
         as_of = dt.datetime(
             day.year, day.month, day.day,
-            args.cutoff_hour, 0, 0, tzinfo=dt.timezone.utc,
+            eff_cutoff, 0, 0, tzinfo=dt.timezone.utc,
         )
         targets = [day + dt.timedelta(days=i) for i in range(args.days_ahead + 1)]
 
@@ -148,7 +186,8 @@ def main() -> None:
 
     print(
         f"predict_history done: predictions={total_pred} bucket_probs={total_probs} "
-        f"window=[{args.start}..{args.end}] cutoff_hour={args.cutoff_hour}"
+        f"window=[{args.start}..{args.end}] "
+        f"book_alignment={args.book_alignment} utc_cutoff_hour={eff_cutoff}"
     )
 
 

@@ -13,3 +13,7 @@ logs/
 # Repo-root data downloads only (do not ignore polymarket_weather/data/).
 /data/
 *.pgpass
+# Repo-root runtime logs from ad-hoc pipeline runs.
+/*.log
+# Personal Cursor IDE settings (project skills under .cursor/skills/ stay tracked).
+.cursor/settings.json

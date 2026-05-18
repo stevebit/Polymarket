@@ -72,6 +72,12 @@ def main() -> None:
         action="store_true",
         help="Skip predict_history replay.",
     )
+    p.add_argument(
+        "--predict-book-alignment",
+        choices=("from-cutoff-hour", "utc-midnight", "utc-noon"),
+        default="from-cutoff-hour",
+        help="Forwarded to predict_history --book-alignment (utc-midnight for intraday CLOB).",
+    )
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
@@ -131,6 +137,8 @@ def main() -> None:
                 args.hist_start,
                 "--end",
                 args.hist_end,
+                "--book-alignment",
+                args.predict_book_alignment,
             ],
             dry=args.dry_run,
         )
