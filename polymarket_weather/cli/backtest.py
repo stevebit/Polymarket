@@ -96,6 +96,28 @@ def main() -> None:
             "utc-noon on predict_history."
         ),
     )
+    p.add_argument(
+        "--min-taker-price",
+        type=float,
+        default=None,
+        metavar="P",
+        help=(
+            "Skip taker fills whose execution price is below P (0..1). "
+            "Use 0.05 to filter out 'long lottery ticket' buys at "
+            "extreme-low prices that empirically lose ~99% of the time."
+        ),
+    )
+    p.add_argument(
+        "--max-taker-price",
+        type=float,
+        default=None,
+        metavar="P",
+        help=(
+            "Skip taker fills whose execution price is above P (0..1). "
+            "Use 0.95 to filter out 'sell certainty' fills at "
+            "extreme-high prices that empirically lose ~100% of the time."
+        ),
+    )
     args = p.parse_args()
     configure_logging(args.verbose)
 
@@ -130,6 +152,8 @@ def main() -> None:
         take_every_n_snapshots=args.take_every_n_snapshots,
         slippage_per_share=args.slippage_per_share,
         min_snapshot_utc_hour=args.min_snapshot_utc_hour,
+        min_taker_price=args.min_taker_price,
+        max_taker_price=args.max_taker_price,
     )
 
     if args.export_json:

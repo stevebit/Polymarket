@@ -422,6 +422,8 @@ def replay_backtest(
     take_every_n_snapshots: int = 1,
     slippage_per_share: float = 0.005,
     min_snapshot_utc_hour: int | None = None,
+    min_taker_price: float | None = None,
+    max_taker_price: float | None = None,
 ) -> BacktestResult:
     """Replay historical snapshots and simulate fills.
 
@@ -441,6 +443,23 @@ def replay_backtest(
     ):
         raise ValueError(
             f"min_snapshot_utc_hour must be in [0, 23], got {min_snapshot_utc_hour!r}"
+        )
+    if min_taker_price is not None and not (0.0 <= min_taker_price < 1.0):
+        raise ValueError(
+            f"min_taker_price must be in [0, 1), got {min_taker_price!r}"
+        )
+    if max_taker_price is not None and not (0.0 < max_taker_price <= 1.0):
+        raise ValueError(
+            f"max_taker_price must be in (0, 1], got {max_taker_price!r}"
+        )
+    if (
+        min_taker_price is not None
+        and max_taker_price is not None
+        and min_taker_price >= max_taker_price
+    ):
+        raise ValueError(
+            f"min_taker_price ({min_taker_price}) must be < "
+            f"max_taker_price ({max_taker_price})"
         )
 
     station_list = list(station_slugs) if station_slugs is not None else config.station_slugs()
@@ -477,6 +496,10 @@ def replay_backtest(
     snapshot_stats["total_snapshots_in_db"] = len(grouped)
     if min_snapshot_utc_hour is not None:
         snapshot_stats["min_snapshot_utc_hour"] = int(min_snapshot_utc_hour)
+    if min_taker_price is not None:
+        snapshot_stats["min_taker_price"] = float(min_taker_price)
+    if max_taker_price is not None:
+        snapshot_stats["max_taker_price"] = float(max_taker_price)
 
     # Per-event open maker orders.
     open_orders: dict[str, list[_OpenOrder]] = {}
@@ -603,6 +626,19 @@ def replay_backtest(
                 if strategy in ("taker", "both"):
                     bb = BucketBook(yes=yes_book, no=no_book)
                     edge = best_taker_edge(p_yes, bb, fees=fees)
+                    if edge is not None and (
+                        (min_taker_price is not None and edge.price < min_taker_price)
+                        or (max_taker_price is not None and edge.price > max_taker_price)
+                    ):
+                        # Strategy-level guard against extreme-price tail
+                        # bets. Empirically these dominate fill count at
+                        # this caps/min-edge regime (e.g. taker_buy at
+                        # 0.001 for 999 shares) and lose ~99% of the time,
+                        # producing large gross losses despite a
+                        # well-calibrated model. Filtering by execution
+                        # price (not by p_model) keeps the model unchanged
+                        # but lets us replay only the regime we trust.
+                        edge = None
                     if edge is not None:
                         # Slippage haircut (review §5.6): assume we cross
                         # the spread by ``slippage_per_share`` cents on
@@ -778,6 +814,13 @@ def replay_backtest(
         notes_bt.append(
             f"Snapshots restricted to UTC hour >= {min_snapshot_utc_hour} "
             "(align with model run_time anchor, e.g. noon replays)."
+        )
+    if min_taker_price is not None or max_taker_price is not None:
+        lo = "0.00" if min_taker_price is None else f"{min_taker_price:.4f}"
+        hi = "1.00" if max_taker_price is None else f"{max_taker_price:.4f}"
+        notes_bt.append(
+            f"Taker fills restricted to execution price in [{lo}, {hi}] "
+            "(extreme-price tail bets filtered)."
         )
 
     return BacktestResult(
