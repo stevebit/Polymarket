@@ -229,27 +229,31 @@ ON CONFLICT (station_id, target_date, source, run_time, member_id) DO UPDATE SET
 
 
 def persist_members(rows: list[MemberRow]) -> int:
+    """Bulk-upsert per-member ensemble forecast rows.
+
+    Uses ``executemany`` over a single connection — Open-Meteo ensembles return
+    ~22k rows per `--past-days 7 --forecast-days 7` over 11 stations, which made
+    the previous per-row ``cur.execute`` loop ~30+ minutes on Azure Postgres.
+    """
     if not rows:
         return 0
     from ..db import with_conn
 
-    n = 0
+    params = [
+        (
+            r.station_id,
+            r.target_date,
+            r.source,
+            r.run_time,
+            r.member_id,
+            r.predicted_max_f,
+            json.dumps(r.raw),
+        )
+        for r in rows
+    ]
     with with_conn() as conn, conn.cursor() as cur:
-        for r in rows:
-            cur.execute(
-                UPSERT_MEMBER_SQL,
-                (
-                    r.station_id,
-                    r.target_date,
-                    r.source,
-                    r.run_time,
-                    r.member_id,
-                    r.predicted_max_f,
-                    json.dumps(r.raw),
-                ),
-            )
-            n += 1
-    return n
+        cur.executemany(UPSERT_MEMBER_SQL, params)
+    return len(params)
 
 
 async def ingest_ensembles_async(
