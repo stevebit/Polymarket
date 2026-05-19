@@ -2,8 +2,12 @@
 
 DRN (Rasp & Lerch 2018) is a small MLP that maps a feature vector
 ``(forecast_mean, forecast_spread, climatology_mean, climatology_std,
-lead_day, doy_sin, doy_cos, today_so_far_max)`` to two outputs ``(mu, log_sigma)``,
-trained on the negative log-likelihood of a Gaussian predictive distribution.
+lead_day, doy_sin, doy_cos, today_so_far_max, neighbor_mean_tmax,
+neighbor_range_tmax, neighbor_distance_weighted_mean, n_neighbors)`` to two
+outputs ``(mu, log_sigma)``, trained on the negative log-likelihood of a
+Gaussian predictive distribution. Spatial neighbor features (from
+spatial.neighbor_tmax_stats) capture micro-climate signals for improved
+accuracy on leads 0-7, especially coastal/urban stations.
 
 This module is a **stub**: the import is lazy so the optional dependency on
 PyTorch never blocks the rest of the pipeline. When the user installs torch

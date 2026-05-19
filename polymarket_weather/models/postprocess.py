@@ -38,6 +38,7 @@ from scipy.optimize import minimize
 from scipy.stats import norm
 
 from ..db import station_id_by_slug, with_conn
+from ..features.spatial import add_spatial_context, neighbor_tmax_stats
 
 log = logging.getLogger(__name__)
 
@@ -203,11 +204,18 @@ def _fetch_training_pairs(
     *,
     end_date: dt.date,
     lookback_days: int,
+    with_neighbors: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """Return (raw_predictions, observations, spread_or_None) aligned by date.
 
     Training pair = forecast issued ``lead_day`` days before target_date,
     matched against the corresponding ``observations`` row (NOAA or WU).
+
+    When with_neighbors=True the caller may subsequently pull neighbor TMAX
+    stats via neighbor_tmax_stats / add_spatial_context (using the neighbor
+    forecasts already backfilled via --extra-icaos) and inject them as extra
+    regressors (e.g. neighbor_mean) or spread modulators (e.g. range) into
+    the EMOS fit without altering the primary-only default path.
     """
     cutoff = end_date - dt.timedelta(days=lookback_days)
     # Pick the latest forecast row at the desired lead — i.e. last run_time
@@ -437,26 +445,24 @@ def latest_fit_for(
 
 
 DEFAULT_SOURCES = (
-    # Global deterministic NWP (existing).
-    "openmeteo:gfs_seamless",
+    # Phase A primary sources (selected 2026-05-18 for multi-lead TMAX skill):
+    # AIFS + IFS + GraphCast + HRRR + bestmatch baseline.
+    # Rationale: AI/physics/operational blend; strong historical API support;
+    # best expected CRPS reduction at leads 0-10. See docs/SOURCE_SELECTION...
+    "openmeteo:aifs025_single",
     "openmeteo:ecmwf_ifs04",
+    "openmeteo:gfs_graphcast025",
+    "openmeteo:hrrr_conus",
+    "openmeteo:bestmatch",
+    # Secondary / ablation (GFS/ICON/GEM) and other sources below.
+    "openmeteo:gfs_seamless",
     "openmeteo:icon_seamless",
     "openmeteo:gem_seamless",
-    "openmeteo:bestmatch",
-    # New Phase 3 sources (review §4.1 / §4.2 / §4.3).
-    "openmeteo:hrrr_conus",
-    "openmeteo:aifs025_single",
-    "openmeteo:gfs_graphcast025",
-    # NBM probabilistic percentiles are pooled at predict time into a
-    # single PercentileCDF; the deterministic ``nbm:station`` and per-
-    # percentile rows are still fit individually so we can compare their
-    # standalone CRPS.
+    # NBM probabilistic percentiles...
     "nbm:station",
     "nbm:p10", "nbm:p25", "nbm:p50", "nbm:p75", "nbm:p90",
-    # NWS public products.
     "nws:gridpoint",
     "nws:daily",
-    # Ensemble traces.
     "openmeteo_ens:gfs025",
     "openmeteo_ens:ecmwf_ifs04",
     "openmeteo_ens:icon_seamless",
@@ -472,9 +478,22 @@ def fit_postprocess(
     lead_days: Sequence[int] = DEFAULT_LEAD_DAYS,
     end_date: dt.date | None = None,
     lookback_days: int = 365,
+    with_neighbors: bool = False,
 ) -> dict[str, int]:
     """Fit and persist EMOS coefficients for every (station, source, lead)
     combo with enough history.
+
+    Phase A acceptance gate (Milestone 1): after multi-lead backfill, run
+    ``python -m polymarket_weather.cli.fit_postprocess --leads 0,1,...,10
+    --lookback-days 180`` and verify that >=80 % of (station, lead<=7) combos
+    produced a fit with >= MIN_TRAIN_PAIRS (30) pairs. Also produce a
+    lead-stratified CRPS report (extend score.py or calibrate CLI) showing
+    improvement vs lead-0-only baseline.
+
+    When with_neighbors=True, training-pair assembly enables optional pull of
+    neighbor stats (mean/std/range/distance-weighted) via spatial.py for use
+    as additional regressors or spread modulators in a future EMOS extension
+    (default remains primary-only for full backward compatibility).
 
     Returns ``{ "fits": <n>, "skipped_too_few": <n>, "skipped_no_data": <n> }``."""
     end_date = end_date or dt.date.today()
@@ -494,6 +513,7 @@ def fit_postprocess(
                     raw, y, spread = _fetch_training_pairs(
                         cur, sid, src, lead,
                         end_date=end_date, lookback_days=lookback_days,
+                        with_neighbors=with_neighbors,
                     )
                     if raw.size == 0:
                         skipped_no_data += 1

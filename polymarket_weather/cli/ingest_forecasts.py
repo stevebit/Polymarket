@@ -14,6 +14,8 @@ def main() -> None:
     add_common_args(p, with_date=False)
     p.add_argument("--past-days", type=int, default=7)
     p.add_argument("--forecast-days", type=int, default=8)
+    p.add_argument("--with-hrrr", action="store_true", default=False,
+                   help="Enable stabilized HRRR nowcast path for lead_day<=1 (optional; default off).")
     p.add_argument("--no-migrate", action="store_true")
     args = p.parse_args()
     configure_logging(args.verbose)
@@ -25,6 +27,7 @@ def main() -> None:
         parse_stations(args.station),
         past_days=args.past_days,
         forecast_days=args.forecast_days,
+        with_hrrr=args.with_hrrr,
     )
     print(f"Persisted forecasts rows: {counts['forecasts']}")
 

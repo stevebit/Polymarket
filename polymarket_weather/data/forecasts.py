@@ -91,6 +91,17 @@ def model_cycle_at(now_utc: dt.datetime, model: str) -> dt.datetime:
     if now_utc.tzinfo is None:
         now_utc = now_utc.replace(tzinfo=dt.timezone.utc)
     if model in HOURLY_CADENCE_MODELS:
+        # HRRR/RAP stabilization (Phase A): for HRRR prefer the most recent
+        # completed CONUS hourly cycle whose valid time lands before the
+        # Polymarket daily market close (default 12 UTC cutoff). This avoids
+        # ingesting post-close cycles for lead-0/1 nowcasts and gives coastal/
+        # urban stations a stable high-res anchor. RAP remains best-effort.
+        if model in {"hrrr_conus", "gfs_hrrr"}:
+            close = now_utc.replace(hour=12, minute=0, second=0, microsecond=0)
+            if now_utc >= close:
+                # use the cycle exactly at close if completed, else prior hour
+                return close if now_utc.hour == 12 else now_utc.replace(hour=11, minute=0, second=0, microsecond=0)
+            return now_utc.replace(minute=0, second=0, microsecond=0)
         return now_utc.replace(minute=0, second=0, microsecond=0)
     # 6-hourly: round down to the most recent multiple of 6 hours.
     cycle_hour = (now_utc.hour // 6) * 6
@@ -921,6 +932,7 @@ async def ingest_forecasts_async(
     *,
     past_days: int = 7,
     forecast_days: int = 8,
+    with_hrrr: bool = False,
 ) -> dict[str, int]:
     from ..db import station_id_by_slug
 
@@ -958,17 +970,27 @@ async def ingest_forecasts_async(
                 collected.extend(bm)
             except Exception as exc:  # noqa: BLE001
                 log.warning("Open-Meteo bestmatch failed for %s: %s", s.slug, exc)
-            # HRRR (review §4.1) — CONUS only; harmless to call for all
-            # current stations (they're all US).
-            try:
-                hrrr = await _fetch_hrrr_conus(
-                    client, s, past_days=past_days, forecast_days=forecast_days
-                )
-                for row in hrrr:
-                    row.station_id = sid
-                collected.extend(hrrr)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("Open-Meteo HRRR failed for %s: %s", s.slug, exc)
+            if with_hrrr:
+                # HRRR (review §4.1) — CONUS only; harmless to call for all
+                # current stations (they're all US).
+                # Phase A stabilization: on 400/timeout fall back to bestmatch
+                # (already fetched) for the lead-0/1 window with explicit log.
+                try:
+                    hrrr = await _fetch_hrrr_conus(
+                        client, s, past_days=past_days, forecast_days=forecast_days
+                    )
+                    for row in hrrr:
+                        row.station_id = sid
+                    collected.extend(hrrr)
+                except Exception as exc:  # noqa: BLE001
+                    if isinstance(exc, (httpx.HTTPStatusError, httpx.TimeoutException)):
+                        log.warning(
+                            "HRRR 400/timeout for %s lead<=1; falling back to "
+                            "GFS/IFS bestmatch for short-lead nowcast window: %s",
+                            s.slug, exc
+                        )
+                    else:
+                        log.warning("Open-Meteo HRRR failed for %s: %s", s.slug, exc)
             # ECMWF AIFS (review §4.3).
             try:
                 aifs = await _fetch_ecmwf_aifs(
@@ -1059,11 +1081,13 @@ def ingest_forecasts(
     *,
     past_days: int = 7,
     forecast_days: int = 8,
+    with_hrrr: bool = False,
 ) -> dict[str, int]:
     return asyncio.run(
         ingest_forecasts_async(
             station_slugs,
             past_days=past_days,
             forecast_days=forecast_days,
+            with_hrrr=with_hrrr,
         )
     )

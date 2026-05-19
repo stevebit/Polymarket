@@ -53,6 +53,11 @@ def main() -> None:
         help="Comma-separated lead days (forecast issued N days before target).",
     )
     p.add_argument("--no-migrate", action="store_true")
+    p.add_argument(
+        "--with-neighbors",
+        action="store_true",
+        help="Enable neighbor TMAX stats (mean/std/range/distance-weighted) as extra regressors or spread modulators in EMOS training (requires prior neighbor backfill).",
+    )
     args = p.parse_args()
     configure_logging(args.verbose)
 
@@ -72,6 +77,7 @@ def main() -> None:
         lead_days=leads,
         end_date=end_date,
         lookback_days=args.lookback_days,
+        with_neighbors=args.with_neighbors,
     )
     print(
         f"Fits={counts['fits']} skipped_too_few={counts['skipped_too_few']} "

@@ -379,3 +379,35 @@ def reliability_to_jsonable(bins: list[ReliabilityBin]) -> list[dict]:
         }
         for b in bins
     ]
+
+
+def lead_stratified_crps_ablation(
+    primary_preds: np.ndarray,
+    neighbor_preds: np.ndarray | None,
+    y: np.ndarray,
+    leads: np.ndarray,
+) -> dict[int, dict[str, float]]:
+    """Compute lead-stratified CRPS for primary-only vs primary+neighbors ablation.
+
+    Returns per-lead dict with 'primary_crps', 'neighbor_crps' (or None if no
+    neighbor data), 'delta', 'n'. Used by calibration / neighbor-ablation report
+    to quantify spatial context value on holdout (esp. leads 0-3 coastal/urban).
+    """
+    from .models.postprocess import _crps_gaussian  # local reuse of CRPS
+
+    if neighbor_preds is None:
+        neighbor_preds = primary_preds  # fallback for primary-only run
+    res: dict[int, dict[str, float]] = {}
+    for lead in sorted(np.unique(leads)):
+        mask = leads == lead
+        if mask.sum() < 5:
+            continue
+        p_crps = float(_crps_gaussian(primary_preds[mask], np.full_like(primary_preds[mask], 4.0), y[mask]).mean())
+        n_crps = float(_crps_gaussian(neighbor_preds[mask], np.full_like(neighbor_preds[mask], 4.0), y[mask]).mean())
+        res[int(lead)] = {
+            "primary_crps": p_crps,
+            "neighbor_crps": n_crps,
+            "delta": n_crps - p_crps,
+            "n": int(mask.sum()),
+        }
+    return res
